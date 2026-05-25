@@ -1,0 +1,26 @@
+# ============================================================
+# AI Voice Call Assistant - Project Dependencies
+# ============================================================
+
+# --- LangChain Multi-Agent Framework ---
+langchain>=0.3.0
+langgraph>=0.2.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+
+# --- Voice Module ---
+faster-whisper>=1.0.0
+edge-tts>=6.1.0
+pyaudio>=0.2.14
+pygame>=2.5.0
+
+# --- Knowledge Base & RAG ---
+chromadb>=0.5.0
+sentence-transformers>=2.7.0
+datasets>=2.20.0
+torch>=2.0.0
+
+# --- API & Utils ---
+openai>=1.50.0
+pyyaml>=6.0
+numpy>=1.26.0

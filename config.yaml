@@ -1,0 +1,51 @@
+# ============================================================
+# AI 语音通话助手 — 全局配置文件
+# 使用方式: from src.utils.logger import load_config
+#           config = load_config("config.yaml")
+# ============================================================
+
+# --- DeepSeek V4 Pro API 配置 (OpenAI 兼容接口) ---
+llm:
+  api_key: "your-deepseek-api-key-here"   # DeepSeek API Key, 获取: https://platform.deepseek.com/
+  base_url: "https://api.deepseek.com/v1"  # DeepSeek API 地址
+  model: "deepseek-chat"                    # 模型名称
+  temperature: 0.3                          # 温度参数，越低越保守
+  max_tokens: 2048                          # 最大输出 token 数
+
+# --- 语音识别 (STT) 配置 ---
+stt:
+  model_size: "large-v3"             # Faster-Whisper 模型: medium=1.5G / large-v3=3G(更准)
+  device: "cuda"                     # 推理设备: cuda / cpu
+  compute_type: "float16"            # 计算精度: float16(GPU) / int8(CPU)
+  language: "zh"                     # 识别语言，zh=中文
+  sample_rate: 16000                 # 采样率
+  vad_threshold: 0.02                # VAD 阈值，安静环境下可能需要很低
+  silence_duration: 2.0              # 静音多少秒后认为说话结束
+  device_index: null                 # 麦克风设备编号，null=系统默认。先运行 python -m src.voice.stt --list 查看
+
+# --- 语音合成 (TTS) 配置 ---
+tts:
+  voice: "zh-CN-XiaoxiaoNeural"      # Edge-TTS 中文女声
+  rate: "+0%"                         # 语速调整
+  pitch: "+0Hz"                       # 音调调整
+
+# --- RAG 知识库配置 ---
+rag:
+  dataset_name: "JimmyMa99/TeleAntiFraud"  # HuggingFace 数据集名称
+  embedding_model: "BAAI/bge-small-zh-v1.5" # 中文 Embedding 模型
+  chroma_persist_dir: "./data/chroma_db"   # ChromaDB 持久化目录
+  collection_name: "scam_knowledge"         # 向量集合名称
+  chunk_size: 512                           # 文本分块大小
+  chunk_overlap: 50                         # 分块重叠大小
+  retrieval_top_k: 5                        # 检索返回数量
+
+# --- Agent 调度配置 ---
+orchestrator:
+  max_conversation_rounds: 10         # 单次通话最大对话轮数
+  scam_confidence_threshold: 0.7      # 诈骗判定置信度阈值
+
+# --- 日志配置 ---
+logging:
+  level: "INFO"                       # DEBUG / INFO / WARNING / ERROR
+  file: "./logs/call_assistant.log"   # 日志文件路径
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

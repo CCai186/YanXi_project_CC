@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 大文件 & 缓存
+data/processed/*.json
+data/raw/
+data/chroma_db/
+data/*.wav
+*.pkl
+*.bin
+indices/
+
+# 保留目录结构
+!data/processed/.gitkeep
+!logs/.gitkeep
+
+# 日志
+logs/
+*.log
+
+# 环境变量（敏感信息）
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 演示视频 & 大文件
+*.mp4
+*.mov
+*.avi
+
+# HuggingFace 缓存
+*.cache/
+
+# 备份 & 参考项目
+backup_v1/
+YanXi-KCN-main/
