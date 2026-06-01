@@ -34,10 +34,6 @@ import os
 if "HF_ENDPOINT" not in os.environ:
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-from sentence_transformers import SentenceTransformer
-
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -95,11 +91,13 @@ class KnowledgeBaseBuilder:
         if self._embedding_model is not None:
             return
 
+        from sentence_transformers import SentenceTransformer
+
         logger.info(f"正在加载 Embedding 模型: {self.embedding_model_name}...")
         self._embedding_model = SentenceTransformer(self.embedding_model_name)
         logger.info(f"Embedding 模型加载完成 (维度={self._embedding_model.get_sentence_embedding_dimension()}) ✓")
 
-    def _get_chroma_client(self) -> chromadb.PersistentClient:
+    def _get_chroma_client(self):
         """
         获取或创建 ChromaDB 持久化客户端。
 
@@ -107,6 +105,9 @@ class KnowledgeBaseBuilder:
             chromadb.PersistentClient: ChromaDB 客户端实例
         """
         if self._chroma_client is None:
+            import chromadb
+            from chromadb.config import Settings as ChromaSettings
+
             # 确保持久化目录存在
             Path(self.chroma_persist_dir).mkdir(parents=True, exist_ok=True)
             self._chroma_client = chromadb.PersistentClient(
@@ -211,7 +212,7 @@ class KnowledgeBaseBuilder:
 
         return collection
 
-    def get_collection(self) -> chromadb.Collection:
+    def get_collection(self):
         """
         获取已构建的 ChromaDB collection（只读访问）。
 
@@ -229,6 +230,39 @@ class KnowledgeBaseBuilder:
                 f"Collection '{self.collection_name}' 不存在，请先运行:\n"
                 f"  python -m src.knowledge.embedder"
             )
+
+
+class Embedder:
+    """
+    Embedding 模型封装，提供统一的文本向量化接口。
+    供 v4 调度器的 SemanticReranker 和 KnowledgeRetriever 使用。
+
+    使用方式:
+        embedder = Embedder(config)
+        vec = embedder.encode("你好")
+    """
+
+    def __init__(self, config: dict):
+        rag_cfg = config.get("rag", {})
+        self.model_name = rag_cfg.get("embedding_model", "BAAI/bge-small-zh-v1.5")
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            logger.info(f"加载 Embedding 模型: {self.model_name}")
+            self._model = SentenceTransformer(self.model_name)
+
+    def encode(self, texts: list[str] | str, normalize: bool = True):
+        """将文本转为向量。"""
+        self._load()
+        if isinstance(texts, str):
+            texts = [texts]
+        return self._model.encode(texts, normalize_embeddings=normalize)
+
+    def get_dimension(self) -> int:
+        self._load()
+        return self._model.get_sentence_embedding_dimension()
 
 
 # ============================================================

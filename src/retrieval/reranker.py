@@ -53,3 +53,65 @@ class SimpleReranker:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [doc for _, doc in scored[:top_n]]
+
+
+class SemanticReranker:
+    """
+    v4 语义重排器，使用 Embedding 模型计算语义相似度并重排序。
+
+    使用方式:
+        from src.knowledge.embedder import Embedder
+        embedder = Embedder(config)
+        reranker = SemanticReranker(embedder=embedder)
+        reranked = reranker.rerank("查询", docs, top_n=5)
+    """
+
+    def __init__(self, embedder=None, semantic_weight: float = 0.6, keyword_weight: float = 0.4):
+        self.embedder = embedder
+        self.semantic_weight = semantic_weight
+        self.keyword_weight = keyword_weight
+
+    def rerank(self, query: str, documents: list[dict], top_n: int = 5) -> list[dict]:
+        """
+        对文档列表进行语义重排序。
+
+        排序策略:
+        1. 语义相似度（使用 Embedding 模型）
+        2. 关键词命中数
+        3. 原始相似度
+        """
+        if not documents:
+            return []
+
+        query_terms = set(query)
+        scored = []
+
+        # 计算语义相似度
+        if self.embedder:
+            try:
+                contents = [d.get("content", "")[:500] for d in documents]
+                query_vec = self.embedder.encode(query)
+                doc_vecs = self.embedder.encode(contents)
+                import numpy as np
+                similarities = np.dot(doc_vecs, query_vec)
+            except Exception:
+                similarities = [0.5] * len(documents)
+        else:
+            similarities = [0.5] * len(documents)
+
+        for i, doc in enumerate(documents):
+            content = doc.get("content", "")
+            # 关键词命中
+            term_hits = sum(1 for t in query_terms if t in content) / max(len(query_terms), 1)
+            # 原始相似度
+            orig_score = doc.get("similarity", 0.5)
+            # 综合得分
+            combined = (
+                float(similarities[i]) * self.semantic_weight
+                + term_hits * self.keyword_weight * 0.5
+                + orig_score * 0.5
+            )
+            scored.append((combined, doc))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [doc for _, doc in scored[:top_n]]

@@ -52,3 +52,13 @@ Thumbs.db
 # 备份 & 参考项目
 backup_v1/
 YanXi-KCN-main/
+xiugai/
+
+# 运行时数据（v4 新增）
+data/call_logs/
+data/habits/
+data/notifications/
+data/recordings/
+
+# 配置备份
+config.yaml.bak

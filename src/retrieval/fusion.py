@@ -78,3 +78,76 @@ class RRFFuser:
 
         ranked = sorted(store.keys(), key=lambda k: fused_scores[k], reverse=True)
         return [(store[k], fused_scores[k]) for k in ranked]
+
+
+class HybridRetriever:
+    """
+    v4 混合检索器，结合向量检索和 BM25 关键词检索。
+
+    使用方式:
+        hybrid = HybridRetriever(
+            vector_retriever=knowledge_retriever,
+            bm25_corpus=docs,
+            reranker=semantic_reranker,
+        )
+        results = hybrid.retrieve("查询", top_k=5)
+    """
+
+    def __init__(
+        self,
+        vector_retriever=None,
+        bm25_corpus: list[dict] = None,
+        reranker=None,
+    ):
+        self.vector_retriever = vector_retriever
+        self.reranker = reranker
+        self._bm25_docs: list[str] = []
+        if bm25_corpus:
+            self._bm25_docs = [d.get("text", "") for d in bm25_corpus]
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[dict]:
+        """混合检索：向量检索 + 关键词检索 → RRF 融合 → 重排序。"""
+        results = []
+
+        # 向量检索
+        if self.vector_retriever:
+            try:
+                vec_results = self.vector_retriever.retrieve(query, top_k=top_k)
+                results.extend(vec_results)
+            except Exception:
+                pass
+
+        # BM25 关键词检索
+        if self._bm25_docs:
+            bm25_results = self._bm25_search(query, top_k)
+            for idx, score in bm25_results:
+                results.append({
+                    "id": f"bm25_{idx}",
+                    "content": self._bm25_docs[idx],
+                    "similarity": score,
+                    "metadata": {},
+                })
+
+        # RRF 融合去重
+        fuser = RRFFuser(k_const=60)
+        results = fuser.fuse(results)
+
+        # 重排序
+        if self.reranker and results:
+            try:
+                results = self.reranker.rerank(query, results, top_n=top_k)
+            except Exception:
+                pass
+
+        return results[:top_k]
+
+    def _bm25_search(self, query: str, top_k: int) -> list[tuple]:
+        """简单的 BM25 风格关键词搜索。"""
+        query_terms = set(query)
+        scored = []
+        for idx, doc in enumerate(self._bm25_docs):
+            score = sum(1 for t in query_terms if t in doc)
+            if score > 0:
+                scored.append((idx, score / max(len(query_terms), 1)))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]

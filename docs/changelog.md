@@ -1,5 +1,59 @@
 # 改进日志
 
+## 2026-06-01 (v4 完整版)
+
+### 11. v4 完整版：8大新模块 + 全链路修复
+
+**问题**：
+1. 业务来电第一轮就生成卡片，对话未完成就结束
+2. 熟人/家人来电在空闲模式直接 forward，不先问来意
+3. 非紧急来电生成"紧急来电"卡片
+4. 语音模式无法输入文字命令（emoji 导致 GBK 崩溃）
+5. sentence-transformers 与 torch/pyarrow DLL 冲突导致 segfault
+6. 配置缺乏校验和环境变量覆盖支持
+
+**新增 8 个模块**：
+- `src/core/config.py`：配置加载器（默认值填充 + 环境变量覆盖 + 必填校验）
+- `src/core/llm_client.py`：统一 LLM 客户端（指数退避重试 + 超时控制 + JSON 解析）
+- `src/store/call_logger.py`：通话记录持久化（JSONL，按日期归档）
+- `src/notification/card_builder.py`：通知卡片系统（外卖/留言/紧急/诈骗 4 种）
+- `src/knowledge/caller_profile.py`：来电者画像（信任评分 + 自动黑白名单）
+- `src/knowledge/knowledge_expander.py`：内置知识库（52 条诈骗话术/业务模板/紧急场景）
+- `src/habit/habit_learner.py`：习惯学习器（LLM 提取日程 + 自动状态推断）
+- `src/agents/conversation_memory.py`：三层对话记忆（短期/工作/长期）
+
+**重构 3 个核心模块**：
+- `src/agents/orchestrator.py`：2 节点 → 8 节点 LangGraph（classify → lookup_profile → infer_presence → route → 4 路 action → notify）
+- `src/main.py`：全新入口（号码解析 / 新增 /habit /profile /stats 等命令 / 多轮对话支持）
+- `config.yaml`：12 配置段（新增 habit/notification/call_log/recorder/caller_profile/conversation_memory/hybrid_retrieval）
+
+**增强 4 个模块**：
+- `src/knowledge/embedder.py`：新增 `Embedder` 类（懒加载）
+- `src/knowledge/retriever.py`：新增 `KnowledgeRetriever` + `add_documents()`
+- `src/retrieval/fusion.py`：新增 `HybridRetriever`（向量+BM25+RRF融合）
+- `src/retrieval/reranker.py`：新增 `SemanticReranker`（Embedding语义重排）
+- `src/voice/recorder.py`：新增通话录音管理
+
+**Bug 修复**：
+- 业务对话只在 `is_complete=True` 时生成卡片（之前每轮都生成）
+- 熟人/家人/领导来电空闲模式改为 `continue_conversation`（先问来意再决定）
+- 非紧急来电不再生成紧急卡片（`should_forward=True` 才生成）
+- 空闲模式非紧急来电使用友好回复模板（不说"机主不方便"）
+- `resume_conversation` 支持熟人/家人来电追问（含轮次限制）
+- 语音模式恢复"输入命令或按 Enter 录音"交互
+- 恢复语音状态切换检测（"我要开会了""别打扰我"等）
+- Windows GBK 崩溃：`sys.stdout.reconfigure(encoding="utf-8")` + 移除所有 emoji 打印
+- pyarrow 版本锁定 21.0.0（24.0.0 与 torch MKL DLL 冲突 segfault）
+- numpy 锁 1.x（2.x 与 scipy 不兼容）
+- `embedder.py` chromadb/sentence_transformers 改为懒加载（避免 import 时触发）
+
+**效果**：
+- 多轮对话逻辑正确：外卖 2 轮完成（问平台+地点→确认），熟人/家人追问后判断
+- 语音模式可打字输入命令（/habit /profile /stats /help）
+- 启动速度提升（语义检索默认关闭，不加载 embedding 模型）
+
+---
+
 ## 2026-05-25 (v2 大升级)
 
 ### 10. 融合 YanXi-KCN 架构：v2 大版本

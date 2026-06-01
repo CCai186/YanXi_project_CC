@@ -1,21 +1,35 @@
 """
-AI 语音通话助手 — 主入口
-=========================
-启动语音助手，监听麦克风输入，通过多 Agent 调度器处理来电，
-并将 Agent 的回复通过 TTS 播报。
+AI 语音通话助手 — 主入口 v4 (完整版)
+=====================================
+集成所有模块的完整启动入口。
+
+模块:
+  ✅ LangGraph 多智能体调度
+  ✅ 习惯学习 (HabitLearner)
+  ✅ 通知卡片 (CardBuilder)
+  ✅ 通话记录 (CallLogger)
+  ✅ 通话录音 (CallRecorder) — 模块A
+  ✅ 来电者画像 (CallerProfile) — 模块B
+  ✅ 对话记忆 (ConversationMemory) — 模块D
+  ✅ 知识库增强 (KnowledgeExpander + HybridRetriever) — 模块F
 
 运行方式:
     python src/main.py               # 默认模式：监听麦克风
     python src/main.py --text        # 文本模式：命令行输入文字模拟
     python src/main.py --test        # 测试模式：运行预设测试用例
 
-完整流程:
-    麦克风输入 → STT 识别 → Orchestrator 调度
-        ├── 诈骗 → 拒接（不响应）
-        ├── 业务 → 对话提取信息 → 生成卡片
-        ├── 紧急 → 转接通知
-        └── 普通 → 礼貌回复
-    → TTS 播报 Agent 回复
+交互命令 (文本模式):
+    /habit 我要自习一下午          → 学习习惯
+    /habit 我每天晚上11点到7点睡觉  → 学习周期性习惯
+    /habits                       → 查看已记录的习惯
+    /habit end 自习                → 结束当前活动
+    /profile 13800001111          → 查看来电者画像
+    /blacklist 13800001111        → 加入黑名单
+    /whitelist 13800001111        → 加入白名单
+    /stats                       → 查看今日统计
+    /recordings                  → 查看最近录音
+    /notifications               → 查看最近通知
+    /help                        → 显示帮助
 """
 
 import argparse
@@ -23,11 +37,19 @@ import asyncio
 import sys
 from pathlib import Path
 
+# Windows 中文环境强制 UTF-8 输出，避免 GBK 编码报错
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.agents.orchestrator import CallOrchestrator
-from src.utils.logger import setup_logger, load_config
+from src.core.config import load_and_validate_config
+from src.utils.logger import setup_logger
 from src.voice.tts import SpeechSynthesizer
 
 logger = setup_logger(__name__)
@@ -36,185 +58,453 @@ logger = setup_logger(__name__)
 def print_banner():
     """打印欢迎横幅。"""
     banner = r"""
-╔══════════════════════════════════════════════════╗
-║        AI 语音通话助手 — Voice Call Assistant     ║
-║                                                  ║
-║  📞 诈骗检测 → 拒接                                ║
-║  📦 业务来电 → 对话 → 信息卡片                     ║
-║  🔔 紧急来电 → 转接机主                            ║
-║                                                  ║
-║  技术栈: LangGraph + DeepSeek + Whisper + EdgeTTS ║
-╚══════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════╗
+║          言犀 - AI 智能通话助手 v4 (完整版)                   ║
+║                                                            ║
+║  [诈骗检测] -> 拦截拒接                                      ║
+║  [业务来电] -> 对话 -> 信息卡片                               ║
+║  [紧急来电] -> 转接机主                                      ║
+║  [习惯学习] -> 自动调整来电策略                               ║
+║  [通话录音] -> 事后回溯                                      ║
+║  [来电画像] -> 号码识别 + 信任评分                            ║
+║  [对话记忆] -> 多轮上下文                                    ║
+║  [知识增强] -> 混合检索 + 扩展知识库                          ║
+║                                                            ║
+║  输入 /help 查看所有命令                                     ║
+╚════════════════════════════════════════════════════════════╝
 """
     print(banner)
 
 
+def print_help():
+    """打印帮助信息。"""
+    help_text = """
+╔════════════════════════════════════════════════════════════╗
+║                      命令帮助                              ║
+╠════════════════════════════════════════════════════════════╣
+║                                                            ║
+║  来电模拟:                                                  ║
+║    直接输入文字模拟来电内容                                   ║
+║    格式: [号码] 内容                                        ║
+║    示例: 13800001111 我是美团外卖的                          ║
+║    示例: 我是快递员 (无号码)                                 ║
+║                                                            ║
+║  习惯学习:                                                  ║
+║    /habit 我要自习一下午                                    ║
+║    /habit 我每天晚上11点到7点睡觉                            ║
+║    /habit end 自习                                          ║
+║    /habits                                                 ║
+║                                                            ║
+║  来电者画像:                                                ║
+║    /profile 13800001111                                    ║
+║    /blacklist 13800001111                                  ║
+║    /whitelist 13800001111                                  ║
+║                                                            ║
+║  统计与记录:                                                ║
+║    /stats                    今日通话统计                    ║
+║    /recordings               最近录音列表                    ║
+║    /notifications            最近通知卡片                    ║
+║                                                            ║
+║  其他:                                                      ║
+║    /help                     显示帮助                       ║
+║    /quit                     退出                           ║
+║                                                            ║
+╚════════════════════════════════════════════════════════════╝
+"""
+    print(help_text)
+
+
+def handle_command(text: str, orchestrator: CallOrchestrator) -> bool:
+    """
+    处理用户命令。
+
+    返回:
+        bool: True 表示继续运行，False 表示退出
+    """
+    text = text.strip()
+    if not text:
+        return True
+
+    # 退出
+    if text in ("/quit", "/exit", "/q"):
+        print("再见！")
+        return False
+
+    # 帮助
+    if text == "/help":
+        print_help()
+        return True
+
+    # 习惯学习
+    if text.startswith("/habit "):
+        user_input = text[7:].strip()
+        if user_input.lower().startswith("end"):
+            keyword = user_input[3:].strip()
+            result = orchestrator.end_activity(keyword)
+            if result:
+                print(f"[OK] 已结束活动: {result}")
+            else:
+                print("[INFO] 没有正在进行的活动")
+        else:
+            result = orchestrator.learn_habit(user_input)
+            print(f"[HABIT] {result.get('reply', '已记录')}")
+            if result.get("mode_change"):
+                print(f"   状态变化: {result['mode_change']}")
+        return True
+
+    # 查看习惯
+    if text == "/habits":
+        print(orchestrator.get_habits_summary())
+        return True
+
+    # 查看画像
+    if text.startswith("/profile "):
+        number = text[9:].strip()
+        profile = orchestrator.get_caller_profile(number)
+        if profile:
+            print(f"[PROFILE] 号码: {profile.phone_number}")
+            print(f"   来电次数: {profile.call_count}")
+            print(f"   信任分数: {profile.trust_score:.2f}")
+            print(f"   标签: {profile.tags}")
+            print(f"   黑名单: {'是' if profile.is_blacklisted else '否'}")
+            print(f"   白名单: {'是' if profile.is_whitelisted else '否'}")
+            if profile.contact_name:
+                print(f"   联系人: {profile.contact_name}")
+            if profile.notes:
+                print(f"   备注: {profile.notes}")
+        else:
+            print(f"[INFO] 未找到号码 {number} 的画像")
+        return True
+
+    # 黑名单
+    if text.startswith("/blacklist "):
+        number = text[11:].strip()
+        orchestrator.blacklist_caller(number)
+        print(f"[BLACKLIST] 已将 {number} 加入黑名单")
+        return True
+
+    # 白名单
+    if text.startswith("/whitelist "):
+        number = text[11:].strip()
+        orchestrator.whitelist_caller(number)
+        print(f"[WHITELIST] 已将 {number} 加入白名单")
+        return True
+
+    # 统计
+    if text == "/stats":
+        stats = orchestrator.get_today_stats()
+        profile_stats = orchestrator.get_profile_stats()
+        print(f"[STATS] 今日通话统计:")
+        print(f"   总计: {stats.get('total', 0)} 次")
+        print(f"   按动作: {stats.get('by_action', {})}")
+        print(f"   按类型: {stats.get('by_type', {})}")
+        print(f"[STATS] 来电者画像统计:")
+        print(f"   总画像: {profile_stats.get('total_profiles', 0)} 个")
+        print(f"   黑名单: {profile_stats.get('blacklisted', 0)} 个")
+        print(f"   白名单: {profile_stats.get('whitelisted', 0)} 个")
+        print(f"   平均信任: {profile_stats.get('avg_trust', 0):.2f}")
+        return True
+
+    # 录音列表
+    if text == "/recordings":
+        recordings = orchestrator.get_recent_recordings(5)
+        if recordings:
+            print(f"[RECORDINGS] 最近录音:")
+            for r in recordings:
+                print(f"   {r.call_id} | {r.duration_sec:.1f}s | "
+                      f"{r.call_type or '?'} | {r.filepath}")
+        else:
+            print("[INFO] 暂无录音记录")
+        return True
+
+    # 通知列表
+    if text == "/notifications":
+        notifications = orchestrator.get_recent_notifications(5)
+        if notifications:
+            print(f"[NOTIFICATIONS] 最近通知:")
+            for n in notifications:
+                print(f"   {n.title} | {n.body[:30]} | {n.priority}")
+        else:
+            print("[INFO] 暂无通知记录")
+        return True
+
+    # 未知命令
+    if text.startswith("/"):
+        print(f"[?] 未知命令: {text}，输入 /help 查看帮助")
+        return True
+
+    return True  # 不是命令，继续处理
+
+
+def parse_caller_input(text: str) -> tuple[str, str]:
+    """
+    解析来电输入，提取号码和内容。
+
+    格式: [号码] 内容
+    示例: "13800001111 我是美团外卖的" → ("13800001111", "我是美团外卖的")
+    示例: "我是快递员" → ("", "我是快递员")
+    """
+    import re
+    match = re.match(r'^(\d{5,15})\s+(.+)$', text)
+    if match:
+        return match.group(1), match.group(2)
+    return "", text
+
+
 def run_text_mode(orchestrator: CallOrchestrator):
-    """
-    文本模式：通过命令行输入文字来模拟来电，不涉及真实麦克风。
-    用于调试和测试 Agent 逻辑。
-
-    支持多轮对话：当上一轮返回 continue_conversation 时，
-    下一轮会保持上下文，直接继续对话，不再重复进行诈骗检测和意图分类。
-
-    支持机主状态命令:
-      /free              设为空闲
-      /busy 开会 30min   设忙碌+原因+时长
-      /dnd 睡觉了        设免打扰
-      /driving           设开车模式
-      /status            查看当前状态
-
-    参数:
-        orchestrator: 已初始化的调度器
-    """
-    from src.utils.presence import get_presence
-
-    presence = get_presence()
-
-    print("\n📝 文本模式 — 直接输入来电内容，输入 'quit' 退出")
-    print("💡 提示: 支持多轮对话 | /busy /free /dnd /driving 切换机主状态\n")
-
-    # 会话状态
-    previous_result = None
+    """文本交互模式。"""
+    print("\n[TEST] 文本模式已启动（输入 /help 查看命令）\n")
 
     while True:
         try:
-            # 显示当前状态标签
-            status_tag = presence.get_summary()
-            prompt = f"📞 [机主:{status_tag}] 来电内容: "
-            call_text = input(prompt).strip()
+            user_input = input(">> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n再见！")
             break
 
-        if call_text.lower() in ("quit", "exit", "q"):
-            print("再见！")
+        if not user_input:
+            continue
+
+        # 处理命令
+        if user_input.startswith("/"):
+            if not handle_command(user_input, orchestrator):
+                break
+            continue
+
+        # 解析来电
+        caller_number, call_text = parse_caller_input(user_input)
+
+        # 处理来电
+        result = orchestrator.run(call_text, caller_number=caller_number)
+
+        # 显示结果
+        print(f"\n[RESULT] 处理结果:")
+        print(f"   类型: {result.get('call_type_name', '?')} "
+              f"(置信度={result.get('confidence', 0):.0%}, "
+              f"方法={result.get('classify_method', '?')})")
+        print(f"   动作: {result.get('final_action', '?')}")
+
+        presence_mode = result.get('presence_mode', 'free')
+        if presence_mode != 'free':
+            print(f"   机主状态: {presence_mode} ({result.get('presence_reason', '')})")
+
+        if result.get('agent_reply'):
+            print(f"   言犀: {result['agent_reply']}")
+
+        if result.get('notification_card'):
+            card = result['notification_card']
+            print(f"   卡片: {card.get('title', '')} - {card.get('body', '')[:40]}")
+
+        # 显示画像信息
+        if caller_number:
+            profile = orchestrator.get_caller_profile(caller_number)
+            if profile and profile.call_count > 0:
+                print(f"   画像: 信任={profile.trust_score:.2f} "
+                      f"来电={profile.call_count}次 标签={profile.tags}")
+
+        print()
+
+
+def run_test_mode(orchestrator: CallOrchestrator):
+    """测试模式：运行预设测试用例。"""
+    print("\n[TEST] 运行测试用例...\n")
+
+    tests = [
+        ("13800001111", "我是美团外卖的，你的餐到楼下了", "food_delivery"),
+        ("13800002222", "您好，我是市公安局的，你涉嫌洗钱案件", "scam"),
+        ("13800003333", "你的快递到菜鸟驿站了", "express"),
+        ("13800004444", "妈，我今天晚上回家吃饭", "family"),
+        ("13800005555", "领导，明天下午有个紧急会议", "leader"),
+        ("13800001111", "美团外卖，你上一单的餐到了", "food_delivery"),  # 同号二次
+        ("13800002222", "你好，我是检察院的", "scam"),  # 诈骗号二次
+    ]
+
+    for number, text, expected in tests:
+        result = orchestrator.run(text, caller_number=number)
+        actual = result.get('type_id', '?')
+        action = result.get('final_action', '?')
+        reply = result.get('agent_reply', '')[:50]
+        card = result.get('notification_card')
+        card_info = f'[CARD] {card["title"]}' if card else ''
+
+        match = '[OK]' if expected in actual or actual in expected else '[?]'
+        print(f"{match} [{number}] {text[:25]}...")
+        print(f"   分类: {actual} | 动作: {action} | {card_info}")
+        print(f"   回复: {reply}...")
+
+        # 画像
+        profile = orchestrator.get_caller_profile(number)
+        if profile:
+            print(f"   信任={profile.trust_score:.2f} 来电={profile.call_count}次 "
+                  f"标签={profile.tags}")
+        print()
+
+    # 测试习惯学习
+    print("=" * 60)
+    print("[HABIT] 习惯学习测试:")
+    print("=" * 60)
+    habit_result = orchestrator.learn_habit("我要自习一下午")
+    print(f"回复: {habit_result.get('reply', '')}")
+    print(f"\n{orchestrator.get_habits_summary()}")
+
+    # 测试黑名单
+    print("\n" + "=" * 60)
+    print("[BLACKLIST] 黑名单测试:")
+    print("=" * 60)
+    orchestrator.blacklist_caller("13800002222")
+    print("已将诈骗号码加入黑名单")
+
+    # 再次来电
+    result = orchestrator.run("你好，我是检察院的", caller_number="13800002222")
+    print(f"黑名单号码来电 → 动作: {result.get('final_action')}")
+
+    # 统计
+    print("\n" + "=" * 60)
+    print("[STATS] 统计:")
+    print("=" * 60)
+    stats = orchestrator.get_today_stats()
+    print(f"今日通话: {stats.get('total', 0)} 次")
+    print(f"按动作: {stats.get('by_action', {})}")
+    print(f"按类型: {stats.get('by_type', {})}")
+
+    profile_stats = orchestrator.get_profile_stats()
+    print(f"画像总数: {profile_stats.get('total_profiles', 0)}")
+    print(f"黑名单: {profile_stats.get('blacklisted', 0)}")
+    print(f"白名单: {profile_stats.get('whitelisted', 0)}")
+
+    print("\n[DONE] 测试完成！")
+
+
+async def run_voice_mode(orchestrator: CallOrchestrator, tts: SpeechSynthesizer):
+    """语音模式：输入命令或按 Enter 录音。"""
+    try:
+        from src.voice.stt import SpeechRecognizer
+        stt = SpeechRecognizer(orchestrator.config)
+    except Exception as e:
+        logger.error(f"STT 初始化失败: {e}")
+        logger.info("请检查 faster-whisper 是否正确安装")
+        return
+
+    from src.utils.presence import get_presence
+    from src.agents.classifier import is_meaningless
+    presence = get_presence()
+
+    print("\n[VOICE] 语音模式已启动")
+    print("  输入文字命令直接执行，按 Enter 开始录音模拟来电")
+    print("  命令: /habit /habits /profile /stats /help /quit")
+    print("  按 Ctrl+C 退出\n")
+
+    previous_result = None  # 多轮对话上下文
+
+    while True:
+        try:
+            # 先接受文字输入，按 Enter = 开始录音
+            cmd = input(">> ").strip()
+
+            # --- 文字命令 ---
+            if cmd:
+                if cmd.startswith("/"):
+                    if not handle_command(cmd, orchestrator):
+                        break
+                    previous_result = None
+                    continue
+                else:
+                    # 直接输入文字当作来电内容（不录音）
+                    text = cmd
+                    if previous_result and previous_result.get("final_action") == "continue_conversation":
+                        result = orchestrator.resume_conversation(previous_result, text)
+                    else:
+                        result = orchestrator.run(text)
+                    previous_result = result
+                    if result.get('agent_reply'):
+                        print(f"回复: {result['agent_reply']}")
+                        await tts.speak(result['agent_reply'])
+                    _display_voice_result(result)
+                    if result.get("final_action") in ("summary_card", "reject", "forward", "general_reply"):
+                        previous_result = None
+                    continue
+
+            # --- 按 Enter 开始录音 ---
+            print("[录音中...]")
+            text = stt.listen(timeout=60.0)
+            if not text:
+                print("[INFO] 未识别到语音")
+                continue
+
+            print(f"[STT] {text}")
+
+            # 无意义检测
+            if is_meaningless(text):
+                print("[INFO] 无意义输入，跳过")
+                continue
+
+            # 语音状态切换检测
+            if _detect_presence_from_speech(text, presence):
+                previous_result = None
+                continue
+
+            # 多轮对话
+            if previous_result and previous_result.get("final_action") == "continue_conversation":
+                result = orchestrator.resume_conversation(previous_result, text)
+            else:
+                result = orchestrator.run(text)
+
+            previous_result = result
+
+            if result.get('agent_reply'):
+                print(f"回复: {result['agent_reply']}")
+                await tts.speak(result['agent_reply'])
+
+            _display_voice_result(result)
+
+            if result.get("final_action") in ("summary_card", "reject", "forward", "general_reply"):
+                previous_result = None
+
+        except KeyboardInterrupt:
+            print("\n再见！")
             break
-
-        if not call_text:
-            continue
-
-        # --- 处理状态切换命令 ---
-        if call_text.startswith("/"):
-            handled = _handle_presence_command(call_text, presence)
-            if handled:
-                previous_result = None  # 状态切换，重置会话
-            continue
-
-        # --- 判断是继续上一轮对话还是新来电 ---
-        if previous_result and previous_result.get("final_action") == "continue_conversation":
-            print("(上下文已保持，直接继续对话...)")
-            result = orchestrator.resume_conversation(previous_result, call_text)
-        else:
-            result = orchestrator.run(call_text)
-
-        previous_result = result
-        _display_result(result)
-
-        if result.get("final_action") in ("summary_card", "reject", "forward", "general_reply"):
-            previous_result = None
+        except Exception as e:
+            logger.error(f"处理出错: {e}")
 
 
-def _handle_presence_command(cmd: str, presence) -> bool:
-    """
-    处理机主状态切换命令。返回 True 表示已处理。
-
-    参数:
-        cmd: 以 / 开头的命令字符串
-        presence: UserPresence 实例
-
-    返回:
-        bool: 是否识别并处理了命令
-    """
-    parts = cmd.split(maxsplit=2)
-    action = parts[0].lower()
-
-    if action == "/status":
-        print(f"\n📊 当前状态: {presence.get_summary()}")
-        print(f"   模式: {presence.get_mode()}")
-        if presence.get_reason():
-            print(f"   原因: {presence.get_reason()}")
-        return True
-
-    if action == "/free":
-        presence.reset()
-        print("✅ 已切换为「空闲」模式 — 正常处理所有来电\n")
-        return True
-
-    if action == "/busy":
-        reason = parts[1] if len(parts) > 1 else ""
-        duration = 0
-        if reason:
-            import re
-            dur_match = re.search(r'(\d+)\s*(分钟|min|分)', reason)
-            if dur_match:
-                duration = int(dur_match.group(1))
-                reason = re.sub(r'\d+\s*(分钟|min|分)', '', reason).strip()
-        presence.set("busy", reason, duration)
-        duration_str = f" ({duration}分钟)" if duration > 0 else ""
-        print(f"✅ 已切换为「忙碌」模式{duration_str}: {reason}\n")
-        return True
-
-    if action == "/dnd":
-        reason = parts[1] if len(parts) > 1 else ""
-        presence.set("dnd", reason)
-        print(f"✅ 已切换为「免打扰」模式: {reason}\n")
-        return True
-
-    if action == "/driving":
-        presence.set("driving", "", duration_min=0)
-        print("✅ 已切换为「开车中」模式\n")
-        return True
-
-    print(f"⚠️ 未知命令: {action}")
-    print("   可用命令: /free  /busy <原因> <时长>  /dnd <原因>  /driving  /status\n")
-    return True
+def _display_voice_result(result: dict):
+    """显示语音模式处理结果。"""
+    action = result.get("final_action", "?")
+    type_name = result.get("call_type_name", "?")
+    print(f"[{action}] 类型={type_name} 置信度={result.get('confidence', 0):.0%}")
+    card = result.get('notification_card')
+    if card:
+        print(f"  卡片: {card.get('title', '')}")
 
 
 def _detect_presence_from_speech(text: str, presence) -> bool:
     """
-    从语音识别的文字中检测机主状态切换意图。
-    如果检测到，直接更新 presence，返回 True。
-    如果只是普通对话，返回 False。
-
+    从语音识别文字中检测机主状态切换意图。
     支持的语音触发词:
-      "我要开会了" / "开始开会" / "我要忙了"                → busy
-      "别打扰我" / "我要睡了" / "免打扰"                     → dnd
-      "我要开车了" / "在开车" / "路上"                       → driving
-      "我好了" / "忙完了" / "有空了" / "没事了"              → free
-
-    参数:
-        text: 语音识别的文本
-        presence: UserPresence 实例
-
-    返回:
-        bool: 是否触发了状态切换
+      "我要开会了"/"开始开会"/"我要忙了" → busy
+      "别打扰我"/"我要睡了"/"免打扰" → dnd
+      "我要开车了"/"在开车"/"路上" → driving
+      "我好了"/"忙完了"/"有空了"/"没事了" → free
     """
-    import re
     text_lower = text.lower().replace(" ", "")
 
-    # --- 免打扰 ---
     dnd_patterns = [
         "别打扰我", "我要睡了", "我要休息", "免打扰", "不要打扰",
         "睡觉了", "睡了", "休息了", "别吵我", "静音",
-        "开启免打扰", "打开免打扰",
     ]
     for pat in dnd_patterns:
         if pat in text_lower or pat in text:
-            reason = text.replace(pat, "").strip()[:20]
-            presence.set("dnd", reason if reason else "休息中")
-            print(f"✅ 语音触发: 免打扰模式 → {presence.get_summary()}\n")
+            presence.set("dnd", "休息中")
+            print(f"[PRESENCE] 语音触发: 免打扰模式")
             return True
 
-    # --- 开车 ---
     driving_patterns = ["我要开车", "在开车", "开车了", "开车中", "驾驶中", "上路了", "我在开车"]
     for pat in driving_patterns:
         if pat in text_lower or pat in text:
             presence.set("driving")
-            print(f"✅ 语音触发: 开车模式\n")
+            print(f"[PRESENCE] 语音触发: 开车模式")
             return True
 
-    # --- 忙碌 ---
     busy_patterns = [
         "我要开会", "开会了", "开始开会", "我要忙", "忙了",
         "我要工作", "工作了", "我要学习", "学习了", "上课了",
@@ -222,12 +512,10 @@ def _detect_presence_from_speech(text: str, presence) -> bool:
     ]
     for pat in busy_patterns:
         if pat in text_lower or pat in text:
-            reason = text.replace(pat, "").strip()[:20]
-            presence.set("busy", reason if reason else "")
-            print(f"✅ 语音触发: 忙碌模式 → {presence.get_summary()}\n")
+            presence.set("busy", "")
+            print(f"[PRESENCE] 语音触发: 忙碌模式")
             return True
 
-    # --- 恢复空闲 ---
     free_patterns = [
         "我好了", "忙完了", "有空了", "没事了", "结束了",
         "开完会", "下课了", "下班了", "忙好了",
@@ -237,205 +525,15 @@ def _detect_presence_from_speech(text: str, presence) -> bool:
     for pat in free_patterns:
         if pat in text_lower or pat in text:
             presence.reset()
-            print(f"✅ 语音触发: 恢复空闲\n")
+            print(f"[PRESENCE] 语音触发: 恢复空闲")
             return True
 
     return False
 
 
-async def run_voice_mode(orchestrator: CallOrchestrator, tts: SpeechSynthesizer):
-    """
-    语音模式：用麦克风录音 → STT 识别 → 调度器处理 → TTS 播报回复。
-
-    支持语音切换机主状态:
-      "我要开会了"     → 忙碌模式
-      "别打扰我"       → 免打扰
-      "我要开车了"     → 开车模式
-      "我忙完了"       → 恢复空闲
-
-    参数:
-        orchestrator: 已初始化的调度器
-        tts: 语音合成器
-    """
-    from src.voice.stt import SpeechRecognizer
-    from src.utils.presence import get_presence
-
-    config = load_config("config.yaml")
-    recognizer = SpeechRecognizer(config)
-    presence = get_presence()
-
-    print("\n🎤 语音模式 — 对麦克风说话，系统将自动识别和处理\n")
-    print("💡 文字命令: /busy /free /dnd /driving /status  |  直接按 Enter = 开始录音模拟来电\n")
-    print("按 Ctrl+C 退出\n")
-
-    # 语音模式的会话上下文
-    previous_result = None
-
-    try:
-        while True:
-            # 显示当前状态，接受文字命令或按 Enter 录音
-            status_tag = presence.get_summary()
-            cmd = input(f"\n[机主:{status_tag}] 输入命令或按 Enter 录音: ").strip()
-
-            # --- 文字命令模式 ---
-            if cmd:
-                if cmd.startswith("/"):
-                    _handle_presence_command(cmd, presence)
-                    previous_result = None
-                else:
-                    # 直接把输入文字当作来电内容（不需要录音）
-                    if previous_result and previous_result.get("final_action") == "continue_conversation":
-                        result = orchestrator.resume_conversation(previous_result, cmd)
-                    else:
-                        result = orchestrator.run(cmd)
-                    previous_result = result
-                    _display_result(result)
-                    if result.get("final_action") in ("summary_card", "reject", "forward", "general_reply"):
-                        previous_result = None
-                continue
-
-            # --- 语音录音模式 ---
-            from src.agents.classifier import is_meaningless
-
-            call_text = recognizer.listen_with_keyboard(timeout=60)
-
-            if not call_text:
-                print("⚠️ 未识别到语音，请重试")
-                continue
-
-            print(f"\n📝 识别结果: {call_text}")
-
-            # 无意义检测
-            if is_meaningless(call_text):
-                print("⚠️ 无意义输入（杂音/重复），请重试")
-                continue
-
-            # 检测是否是状态切换命令
-            if _detect_presence_from_speech(call_text, presence):
-                previous_result = None
-                continue
-
-            # 3. 运行调度器（保持上下文）
-            print("🔄 正在分析处理...")
-            if previous_result and previous_result.get("final_action") == "continue_conversation":
-                result = orchestrator.resume_conversation(previous_result, call_text)
-            else:
-                result = orchestrator.run(call_text)
-
-            # 3. TTS 播报 Agent 回复
-            agent_reply = result.get("agent_reply", "")
-            if agent_reply:
-                print(f"\n🔊 播放回复: {agent_reply}")
-                await tts.speak(agent_reply)
-
-            # 4. 显示处理结果并更新上下文
-            _display_result(result)
-            previous_result = result
-
-            # 对话结束则重置上下文
-            if result.get("final_action") in ("summary_card", "reject", "forward", "general_reply"):
-                previous_result = None
-
-    except KeyboardInterrupt:
-        print("\n\n再见！")
-    finally:
-        recognizer.close()
-        tts.close()
-
-
-def run_test_mode(orchestrator: CallOrchestrator):
-    """
-    测试模式：运行预设的测试用例，验证三个场景。
-
-    参数:
-        orchestrator: 已初始化的调度器
-    """
-    print("\n🧪 测试模式 — 运行预设测试用例\n")
-
-    test_cases = [
-        ("🚫 诈骗场景", "您好，我是市公安局的，你涉嫌一起洗钱案件，请配合调查，把你的身份证号和银行卡号告诉我。"),
-        ("📦 外卖场景", "喂，你好，我是美团外卖的，你的餐到了，现在在楼下，你下来拿还是给你放门卫？"),
-        ("🔔 紧急场景", "喂？我是你妈，你爸刚才在家摔倒了，好像骨折了，我们正在去市医院的路上，你赶紧过来！"),
-        ("📞 普通推销", "你好，我是XX教育的课程顾问，想跟您介绍一下我们的英语培训课程，现在有优惠活动..."),
-    ]
-
-    for i, (label, text) in enumerate(test_cases, 1):
-        print(f"\n{'='*60}")
-        print(f"测试 {i}: {label}")
-        print(f"来电: {text[:60]}...")
-        print(f"{'='*60}")
-
-        result = orchestrator.run(text)
-        _display_result(result)
-
-    print("\n✅ 全部测试完成")
-
-
-def _display_result(result: dict):
-    """
-    在终端中显示处理结果。
-    根据 final_action 展示不同的信息。
-
-    参数:
-        result: 调度器返回的结果字典
-    """
-    action = result.get("final_action", "unknown")
-    agent_reply = result.get("agent_reply", "")
-
-    call_type = result.get("call_type_name", "")
-    confidence = result.get("confidence", 0)
-    method = result.get("classify_method", "")
-
-    print(f"\n{'─'*50}")
-    print(f"📊 处理结果: {action}")
-    if call_type:
-        print(f"🏷️  来电类型: {call_type} (置信度={confidence:.0%}, {method})")
-    if agent_reply:
-        print(f"🤖 Agent 回复: {agent_reply}")
-    print(f"{'─'*50}")
-
-    if action == "reject":
-        print("🚫 诈骗电话 — 已拒接！")
-        sr = result.get("scam_result", {})
-        print(f"   类型: {sr.get('scam_type', '未知')}")
-        print(f"   置信度: {sr.get('confidence', 0):.0%}")
-        print(f"   理由: {sr.get('reason', '')}")
-
-    elif action == "summary_card":
-        print("📋 业务来电 — 信息已记录")
-        print(result.get("final_message", ""))
-
-    elif action == "forward":
-        # 判断是紧急转接还是朋友来电转接
-        intent = result.get("intent", "")
-        if intent == "urgent":
-            print("🔔 紧急来电 — 正在转接机主！")
-        else:
-            print("📞 朋友来电 — 正在转接机主")
-        print(result.get("final_message", ""))
-
-    elif action == "general_reply":
-        print("📝 普通来电 — 已代接")
-        print(result.get("final_message", ""))
-
-    elif action == "continue_conversation":
-        print("💬 需要继续对话...")
-
-    else:
-        print(f"⚠️ 未知动作: {action}")
-        print(result)
-
-
-# ============================================================
-# 命令行入口
-# ============================================================
-
 def main():
-    """
-    主入口函数。解析命令行参数，选择运行模式。
-    """
     parser = argparse.ArgumentParser(
-        description="AI 语音通话助手 — 智能代接电话",
+        description="言犀 — AI 智能通话助手 v4",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -459,22 +557,30 @@ def main():
 
     # --- 加载配置 ---
     logger.info("正在加载配置...")
-    config = load_config("config.yaml")
+    config = load_and_validate_config("config.yaml")
 
     # 检查 API Key
     api_key = config.get("llm", {}).get("api_key", "")
     if api_key in ("", "your-deepseek-api-key-here", "sk-your-key"):
         logger.warning("⚠️ 未配置 DeepSeek API Key！")
-        logger.warning("请在 config.yaml 中设置 llm.api_key")
+        logger.warning("请在 config.yaml 中设置 llm.api_key 或设置环境变量 DEEPSEEK_API_KEY")
         logger.info("")
         logger.info("获取 API Key: https://platform.deepseek.com/")
         if not args.test and not args.text:
-            logger.info("切换为测试模式（不需要 API Key 的文本演示）...")
+            logger.info("切换为文本模式（不需要 API Key 的基础功能仍可用）...")
             args.text = True
 
     # --- 初始化调度器 ---
-    logger.info("正在初始化调度器和子 Agent...")
-    orchestrator = CallOrchestrator(config)
+    logger.info("正在初始化调度器和子模块...")
+    try:
+        orchestrator = CallOrchestrator(config)
+        logger.info("✅ 所有模块初始化完成")
+    except Exception as e:
+        logger.error(f"初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
+        logger.info("尝试使用基础模式...")
+        sys.exit(1)
 
     # --- 选择运行模式 ---
     if args.test:
@@ -482,7 +588,6 @@ def main():
     elif args.text:
         run_text_mode(orchestrator)
     else:
-        # 语音模式：需要麦克风和扬声器
         tts = SpeechSynthesizer(config)
         asyncio.run(run_voice_mode(orchestrator, tts))
 

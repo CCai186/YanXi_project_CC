@@ -1,5 +1,5 @@
 # ============================================================
-# AI Voice Call Assistant - Project Dependencies
+# 言犀 AI 智能通话助手 - 项目依赖 v4 (完整版)
 # ============================================================
 
 # --- LangChain Multi-Agent Framework ---
@@ -7,6 +7,9 @@ langchain>=0.3.0
 langgraph>=0.2.0
 langchain-openai>=0.2.0
 langchain-community>=0.3.0
+
+# --- LLM API ---
+openai>=1.50.0
 
 # --- Voice Module ---
 faster-whisper>=1.0.0
@@ -20,7 +23,26 @@ sentence-transformers>=2.7.0
 datasets>=2.20.0
 torch>=2.0.0
 
-# --- API & Utils ---
-openai>=1.50.0
+# --- Data & Config ---
 pyyaml>=6.0
 numpy>=1.26.0
+pydantic>=2.0.0
+
+# ============================================================
+# 安装说明
+# ============================================================
+#
+# 1. 基础安装 (文本模式，不需要 GPU):
+#    pip install -r requirements.txt --no-deps torch
+#
+# 2. 完整安装 (语音模式，需要 GPU):
+#    pip install -r requirements.txt
+#
+# 3. 系统级依赖:
+#    Ubuntu/Debian: sudo apt install portaudio19-dev ffmpeg
+#    macOS:         brew install portaudio ffmpeg
+#
+# 4. GPU 支持 (NVIDIA):
+#    pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# ============================================================

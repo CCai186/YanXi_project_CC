@@ -1,51 +1,87 @@
 # ============================================================
-# AI 语音通话助手 — 全局配置文件
-# 使用方式: from src.utils.logger import load_config
-#           config = load_config("config.yaml")
+# 言犀 AI 智能通话助手 - 配置文件 v4 (完整版)
 # ============================================================
 
-# --- DeepSeek V4 Pro API 配置 (OpenAI 兼容接口) ---
+# --- LLM 配置 ---
 llm:
-  api_key: "your-deepseek-api-key-here"   # DeepSeek API Key, 获取: https://platform.deepseek.com/
+  api_key: "sk-063ef512688f44f7a86a5315fcd0a90b"   # DeepSeek API Key
   base_url: "https://api.deepseek.com/v1"  # DeepSeek API 地址
   model: "deepseek-chat"                    # 模型名称
   temperature: 0.3                          # 温度参数，越低越保守
   max_tokens: 2048                          # 最大输出 token 数
+  timeout: 30                               # API 调用超时秒数
+  retry:                                    # 重试配置
+    max_retries: 3                          # 最大重试次数
+    base_delay: 1.0                         # 首次重试等待秒数 (指数退避)
 
-# --- 语音识别 (STT) 配置 ---
+# --- 语音识别 (STT) ---
 stt:
-  model_size: "large-v3"             # Faster-Whisper 模型: medium=1.5G / large-v3=3G(更准)
-  device: "cuda"                     # 推理设备: cuda / cpu
-  compute_type: "float16"            # 计算精度: float16(GPU) / int8(CPU)
-  language: "zh"                     # 识别语言，zh=中文
-  sample_rate: 16000                 # 采样率
-  vad_threshold: 0.02                # VAD 阈值，安静环境下可能需要很低
-  silence_duration: 2.0              # 静音多少秒后认为说话结束
-  device_index: null                 # 麦克风设备编号，null=系统默认。先运行 python -m src.voice.stt --list 查看
+  model_size: "large-v3"        # Faster-Whisper 模型大小: tiny/base/small/medium/large-v3
+  device: "cuda"                # 推理设备: cuda / cpu
+  compute_type: "float16"       # 计算精度: float16 / int8 / float32
+  language: "zh"                # 语言代码
+  sample_rate: 16000            # 采样率
+  vad_threshold: 0.02           # VAD 静音检测阈值
+  silence_duration: 2.0         # 静音持续时间 (秒)
+  device_index: null            # 麦克风设备索引 (null=默认)
 
-# --- 语音合成 (TTS) 配置 ---
+# --- 语音合成 (TTS) ---
 tts:
-  voice: "zh-CN-XiaoxiaoNeural"      # Edge-TTS 中文女声
-  rate: "+0%"                         # 语速调整
-  pitch: "+0Hz"                       # 音调调整
+  voice: "zh-CN-XiaoxiaoNeural" # Edge-TTS 语音
+  rate: "+0%"                   # 语速调整
+  pitch: "+0Hz"                 # 音调调整
 
-# --- RAG 知识库配置 ---
+# --- RAG 知识库 ---
 rag:
-  dataset_name: "JimmyMa99/TeleAntiFraud"  # HuggingFace 数据集名称
-  embedding_model: "BAAI/bge-small-zh-v1.5" # 中文 Embedding 模型
-  chroma_persist_dir: "./data/chroma_db"   # ChromaDB 持久化目录
-  collection_name: "scam_knowledge"         # 向量集合名称
-  chunk_size: 512                           # 文本分块大小
-  chunk_overlap: 50                         # 分块重叠大小
-  retrieval_top_k: 5                        # 检索返回数量
+  embedding_model: "BAAI/bge-small-zh-v1.5"  # 嵌入模型
+  chroma_persist_dir: "./data/chroma_db"      # ChromaDB 持久化目录
+  collection_name: "scam_knowledge"           # 集合名称
+  chunk_size: 512                             # 分块大小
+  chunk_overlap: 50                           # 分块重叠
+  retrieval_top_k: 5                          # 检索返回数量
+  enable_semantic: false                      # 语义检索（需网络下载模型，首次加载慢）
 
 # --- Agent 调度配置 ---
 orchestrator:
   max_conversation_rounds: 10         # 单次通话最大对话轮数
   scam_confidence_threshold: 0.7      # 诈骗判定置信度阈值
 
+# --- 习惯学习配置 ---
+habit:
+  persist_path: "./data/habits/habit_store.json"  # 习惯数据持久化文件路径
+  auto_detect: true                   # 是否自动根据习惯推断机主状态
+
+# --- 通知卡片配置 ---
+notification:
+  persist_path: "./data/notifications"  # 通知卡片持久化目录
+
+# --- 通话记录配置 ---
+call_log:
+  persist_dir: "./data/call_logs"     # 通话记录持久化目录
+
+# --- 通话录音配置 (模块A) ---
+recorder:
+  persist_dir: "./data/recordings"    # 录音文件存储目录
+
+# --- 来电者画像配置 (模块B) ---
+caller_profile:
+  persist_path: "./data/caller_profiles.json"  # 画像数据持久化文件
+
+# --- 对话记忆配置 (模块D) ---
+conversation_memory:
+  max_short_term: 50                  # 短期记忆最大条数
+  context_window: 10                  # 上下文窗口大小
+
+# --- 混合检索配置 (模块F) ---
+hybrid_retrieval:
+  bm25_weight: 0.5                    # BM25 检索权重
+  vector_weight: 0.5                  # 向量检索权重
+  rrf_k: 60                           # RRF 融合参数
+  reranker_semantic_weight: 0.6       # 重排序语义权重
+  reranker_keyword_weight: 0.4        # 重排序关键词权重
+
 # --- 日志配置 ---
 logging:
-  level: "INFO"                       # DEBUG / INFO / WARNING / ERROR
-  file: "./logs/call_assistant.log"   # 日志文件路径
-  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  level: "INFO"                       # 日志级别: DEBUG/INFO/WARNING/ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./data/yanxi.log"            # 日志文件路径 (null=不写文件)

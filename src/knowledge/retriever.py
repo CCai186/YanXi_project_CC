@@ -409,6 +409,54 @@ def _compute_keyword_score(query_tokens: list[str], doc_tokens: list[str]) -> fl
     return final_score
 
 
+class KnowledgeRetriever:
+    """
+    v4 增强检索器，基于 ScamKnowledgeRetriever 封装。
+    提供 retrieve() 和 add_documents() 接口供 HybridRetriever 和 KnowledgeExpander 使用。
+
+    使用方式:
+        from src.knowledge.embedder import Embedder
+        embedder = Embedder(config)
+        retriever = KnowledgeRetriever(config, embedder)
+        results = retriever.retrieve("查询文本", top_k=5)
+    """
+
+    def __init__(self, config: dict, embedder=None):
+        self.config = config
+        self.embedder = embedder
+        self._base = ScamKnowledgeRetriever(config)
+        self._extra_docs: list[dict] = []
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[dict]:
+        """检索相似文档，合并内置知识库和扩展文档。"""
+        results = self._base.retrieve(query, top_k=top_k)
+
+        # 也从扩展文档中做简单文本匹配
+        if self._extra_docs:
+            for doc in self._extra_docs:
+                text = doc.get("text", "")
+                # 简单关键词匹配
+                query_words = set(query)
+                text_words = set(text)
+                if query_words & text_words:
+                    results.append({
+                        "id": doc.get("text", "")[:50],
+                        "content": text,
+                        "similarity": 0.5,
+                        "metadata": {
+                            "category": doc.get("category", ""),
+                            "sub_type": doc.get("sub_type", ""),
+                            "label": "fraud" if doc.get("category") == "scam" else "normal",
+                        },
+                    })
+
+        return results[:top_k]
+
+    def add_documents(self, docs: list[dict]) -> None:
+        """添加扩展文档到检索器。"""
+        self._extra_docs.extend(docs)
+
+
 # ============================================================
 # 独立测试入口
 # ============================================================

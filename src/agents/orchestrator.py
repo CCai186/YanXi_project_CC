@@ -1,26 +1,30 @@
 """
-主调度器 (Orchestrator) v2
-==========================
-基于三级分类器 + 16 种来电类型 + 预设处理规则的新调度系统。
+主调度器 (Orchestrator) v4 — 完整版
+====================================
+集成所有模块的 LangGraph 多智能体调度系统。
+
+模块集成:
+  ✅ LangGraph 状态图驱动
+  ✅ HabitLearner — 习惯学习
+  ✅ CardBuilder — 通知卡片
+  ✅ CallLogger — 通话记录
+  ✅ CallRecorder — 通话录音 (模块A)
+  ✅ CallerProfile — 来电者画像 (模块B)
+  ✅ ConversationMemory — 对话记忆 (模块D)
+  ✅ HybridRetriever — 混合检索 (模块F)
+  ✅ KnowledgeExpander — 知识库扩展 (模块F)
+  ✅ LLMClient — 统一 LLM 调用
 
 流程:
-  STT文本 → 三级分类(关键词→RAG→LLM) → 查找处理规则 → 执行动作
-
-动作类型:
-  - reject:   直接拒接（诈骗/推销/游戏推广）
-  - forward:  转接机主（面试通知/重要来电）
-  - proxy:    AI 代接对话（外卖/快递/打车）
-  - record:   记录留言（同事/客户/银行）
-  - ask:      追问信息（家人/朋友/领导/普通）
-
-相比 v1 的改进:
-  - 分类从 4 类扩展到 16 类
-  - 关键词+RAG 分类不消耗 LLM token（仅低置信度时才调 LLM）
-  - 预设处理规则替代动态生成，回复更稳定
+  STT文本 → classify → lookup_profile → infer_presence → route → action → notify
+               ↑              ↑
+        CallerProfile    HabitLearner
+        ConversationMemory
 """
 
-import json
-from typing import Literal, TypedDict
+import time
+import uuid
+from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
 
@@ -30,86 +34,213 @@ from src.agents.call_types import (
 from src.agents.classifier import ThreeTierClassifier
 from src.agents.business_handler import BusinessHandler
 from src.agents.urgent_forwarder import UrgentForwarder
+from src.agents.conversation_memory import ConversationMemory
+from src.core.llm_client import LLMClient
+from src.habit.habit_learner import HabitLearner
+from src.knowledge.caller_profile import CallerProfileStore, CallerProfile
+from src.knowledge.knowledge_expander import KnowledgeExpander
+from src.notification.card_builder import CardBuilder, NotificationStore
+from src.store.call_logger import CallLogger
 from src.utils.logger import setup_logger
 from src.utils.presence import get_presence
 
 logger = setup_logger(__name__)
 
 
-class OrchestratorState(TypedDict):
+class OrchestratorState(TypedDict, total=False):
     """LangGraph 全局状态"""
+    # 输入
     call_text: str
-    conversation_history: list[dict]
+    caller_number: str
+    # 分类结果
     type_id: str
     call_type_name: str
     confidence: float
     classify_method: str
+    # 机主状态
+    presence_mode: str
+    presence_reason: str
+    # 来电者画像
+    caller_profile: Optional[dict]
+    # 动作
     final_action: str
     final_message: str
     agent_reply: str
-    business_result: dict
-    urgent_result: dict
+    # 通知卡片
+    notification_card: Optional[dict]
+    # 对话记忆
+    conversation_memory: Optional[dict]
 
 
 class CallOrchestrator:
     """
-    来电调度器 v2。
-    用三级分类器 + 预设规则替代 LLM 动态判断。
+    基于 LangGraph 的多智能体调度器 v4。
+
+    完整流程:
+      来电文本 → 分类 → 画像查询 → 习惯推断 → 路由 → 动作 → 通知
     """
 
     def __init__(self, config: dict):
         self.config = config
 
-        # 初始化三级分类器
+        # --- 核心组件 ---
+        self.llm_client = LLMClient(config)
         self.classifier = ThreeTierClassifier(config)
-
-        # 尝试注入 RAG 检索器（初始化时不加载模型，安全）
-        try:
-            from src.knowledge.retriever import ScamKnowledgeRetriever
-            self.classifier.retriever = ScamKnowledgeRetriever(config)
-            logger.info("RAG 检索器已注入分类器")
-        except Exception as e:
-            logger.warning(f"RAG 检索器注入失败（将仅用关键词+LLM分类）: {e}")
-
-        # 子 Agent
         self.business_handler = BusinessHandler(config)
         self.urgent_forwarder = UrgentForwarder(config)
+        self.card_builder = CardBuilder()
 
-        # LangGraph
+        # --- 模块A: 通话录音 ---
+        recorder_cfg = config.get("recorder", {})
+        try:
+            from src.voice.recorder import CallRecorder
+            self.recorder = CallRecorder(
+                persist_dir=recorder_cfg.get("persist_dir", "./data/recordings")
+            )
+        except Exception as e:
+            logger.warning(f"录音模块初始化失败（将跳过录音功能）: {e}")
+            self.recorder = None
+
+        # --- 模块B: 来电者画像 ---
+        profile_cfg = config.get("caller_profile", {})
+        self.caller_profile_store = CallerProfileStore(
+            persist_path=profile_cfg.get("persist_path", "./data/caller_profiles.json")
+        )
+
+        # --- 模块D: 对话记忆 ---
+        mem_cfg = config.get("conversation_memory", {})
+        self.conversation_memory = ConversationMemory(
+            max_short_term=mem_cfg.get("max_short_term", 50)
+        )
+
+        # --- 模块F: 知识库增强 ---
+        self.knowledge_expander = KnowledgeExpander()
+        self._init_enhanced_retrieval(config)
+
+        # --- 习惯学习 ---
+        self.habit_learner = HabitLearner(config)
+
+        # --- 通知系统 ---
+        notif_cfg = config.get("notification", {})
+        self.notification_store = NotificationStore(
+            persist_path=notif_cfg.get("persist_path", "./data/notifications")
+        )
+
+        # --- 通话记录 ---
+        log_cfg = config.get("call_log", {})
+        self.call_logger = CallLogger(
+            persist_dir=log_cfg.get("persist_dir", "./data/call_logs")
+        )
+
+        # --- 机主状态 ---
+        self.presence = get_presence()
+
+        # --- 构建 LangGraph ---
         self.graph = self._build_graph()
-        logger.info("Orchestrator v2 已就绪 (16类分类 + 三级分类器)")
+        logger.info("CallOrchestrator v4 初始化完成（含模块ABDF）")
+
+    def _init_enhanced_retrieval(self, config: dict) -> None:
+        """初始化增强检索系统（模块F）。
+        注意：sentence-transformers 在部分环境下会导致 segfault，
+        因此默认仅使用关键词模式，语义模式需显式启用。
+        """
+        # 默认使用基础检索（关键词模式），避免 sentence-transformers segfault
+        self.embedder = None
+        self.retriever = None
+        self.reranker = None
+        self.hybrid_retriever = None
+
+        # 检查是否启用语义模式
+        rag_cfg = config.get("rag", {})
+        if not rag_cfg.get("enable_semantic", False):
+            logger.info("检索系统: 关键词模式（语义模式未启用，在 config.yaml 的 rag.enable_semantic 设为 true 可开启）")
+            return
+
+        try:
+            from src.knowledge.embedder import Embedder
+            from src.knowledge.retriever import KnowledgeRetriever
+
+            self.embedder = Embedder(config)
+            self.retriever = KnowledgeRetriever(config, self.embedder)
+
+            # 扩展知识库
+            expand_count = self.knowledge_expander.expand_all(self.retriever)
+            logger.info(f"知识库扩展: 新增 {expand_count} 条知识")
+
+            # 构建混合检索
+            all_docs = self.knowledge_expander.get_all_documents()
+            from src.retrieval.reranker import SemanticReranker
+            self.reranker = SemanticReranker(embedder=self.embedder)
+            from src.retrieval.fusion import HybridRetriever
+            self.hybrid_retriever = HybridRetriever(
+                vector_retriever=self.retriever,
+                bm25_corpus=all_docs,
+                reranker=self.reranker,
+            )
+
+            # 更新分类器的检索器
+            if hasattr(self.classifier, 'retriever'):
+                self.classifier.retriever = self.hybrid_retriever
+
+            logger.info("增强检索系统初始化完成（语义模式）")
+        except Exception as e:
+            logger.warning(f"增强检索系统初始化失败（将使用关键词模式）: {e}")
+            self.embedder = None
+            self.retriever = None
+            self.reranker = None
+            self.hybrid_retriever = None
 
     def _build_graph(self) -> StateGraph:
-        """构建简化版状态图：分类 → 路由 → 动作"""
-        workflow = StateGraph(OrchestratorState)
+        """构建 LangGraph 状态图。"""
+        graph = StateGraph(OrchestratorState)
 
-        workflow.add_node("classify", self._classify_node)
-        workflow.add_node("action", self._action_node)
+        # 添加节点
+        graph.add_node("classify", self._node_classify)
+        graph.add_node("lookup_profile", self._node_lookup_profile)
+        graph.add_node("infer_presence", self._node_infer_presence)
+        graph.add_node("route", self._node_route)
+        graph.add_node("handle_scam", self._node_handle_scam)
+        graph.add_node("handle_business", self._node_handle_business)
+        graph.add_node("handle_urgent", self._node_handle_urgent)
+        graph.add_node("handle_normal", self._node_handle_normal)
+        graph.add_node("notify", self._node_notify)
 
-        workflow.set_entry_point("classify")
-        workflow.add_edge("classify", "action")
-        workflow.add_edge("action", END)
+        # 设置入口
+        graph.set_entry_point("classify")
 
-        return workflow.compile()
+        # 边
+        graph.add_edge("classify", "lookup_profile")
+        graph.add_edge("lookup_profile", "infer_presence")
+        graph.add_edge("infer_presence", "route")
+        graph.add_conditional_edges(
+            "route",
+            self._route_by_type,
+            {
+                "scam": "handle_scam",
+                "business": "handle_business",
+                "urgent": "handle_urgent",
+                "normal": "handle_normal",
+            },
+        )
+        graph.add_edge("handle_scam", "notify")
+        graph.add_edge("handle_business", "notify")
+        graph.add_edge("handle_urgent", "notify")
+        graph.add_edge("handle_normal", "notify")
+        graph.add_edge("notify", END)
+
+        return graph.compile()
 
     # ============================================================
-    # 节点实现
+    # LangGraph 节点
     # ============================================================
 
-    def _classify_node(self, state: OrchestratorState) -> dict:
-        """
-        节点 1: 三级分类。
-        用关键词→RAG→LLM 确定来电类型。
-        """
-        call_text = state.get("call_text", "")
-        logger.info("=" * 50)
-        logger.info(f"📍 分类: {call_text[:80]}...")
+    def _node_classify(self, state: dict) -> dict:
+        """分类节点：三级分类器。"""
+        text = state.get("call_text", "")
+        if not text:
+            return {"type_id": "general", "call_type_name": "未知", "confidence": 0.0, "classify_method": "empty"}
 
-        result = self.classifier.classify(call_text)
-
-        logger.info(f"  → {result.call_type.emoji} {result.call_type.name} "
-                     f"(置信度={result.confidence:.0%}, 方法={result.method})")
-
+        result = self.classifier.classify(text)
         return {
             "type_id": result.type_id,
             "call_type_name": result.call_type.name,
@@ -117,315 +248,618 @@ class CallOrchestrator:
             "classify_method": result.method,
         }
 
-    def _action_node(self, state: OrchestratorState) -> dict:
-        """
-        节点 2: 执行动作。
-        根据来电类型 + 机主状态，执行对应处理动作。
-        """
+    def _node_lookup_profile(self, state: dict) -> dict:
+        """画像查询节点：查看来电者历史（模块B）。"""
+        caller_number = state.get("caller_number", "")
+        if not caller_number:
+            return {"caller_profile": None}
+
+        profile = self.caller_profile_store.lookup(caller_number)
+        if profile:
+            logger.info(f"来电者画像: {caller_number} 信任={profile.trust_score:.2f} "
+                        f"标签={profile.tags} 来电={profile.call_count}次")
+            # 设置长期记忆
+            self.conversation_memory.set_long_term(profile.to_dict())
+            return {"caller_profile": profile.to_dict()}
+        return {"caller_profile": None}
+
+    def _node_infer_presence(self, state: dict) -> dict:
+        """习惯推断节点：根据习惯推断机主状态。"""
+        mode, reason = self.habit_learner.infer_presence_mode()
+        if mode != "free":
+            # 使用 UserPresence.set() 方法
+            self.presence.set(mode, reason)
+        return {"presence_mode": mode, "presence_reason": reason}
+
+    def _node_route(self, state: dict) -> dict:
+        """路由节点：根据分类结果 + 机主状态 + 来电者画像决定路由。"""
         type_id = state.get("type_id", "general")
-        call_text = state.get("call_text", "")
-        presence = get_presence()
-        mode = presence.get_mode()
+        presence_mode = state.get("presence_mode", "free")
+        profile_dict = state.get("caller_profile")
+
+        # 黑名单直接走诈骗
+        if profile_dict and profile_dict.get("is_blacklisted"):
+            logger.info("来电者在黑名单中，路由到诈骗处理")
+            return {"final_action": "reject"}
+
+        # 白名单直接走转接
+        if profile_dict and profile_dict.get("is_whitelisted"):
+            logger.info("来电者在白名单中，优先转接")
+            if type_id in ("scam",):
+                return {"final_action": "reject"}
+            return {"final_action": "forward"}
+
+        # 机主繁忙/免打扰时，只有紧急来电转接
+        if presence_mode in ("busy", "dnd"):
+            if type_id in ("scam",):
+                return {"final_action": "reject"}
+            if type_id in ("family", "urgent"):
+                return {"final_action": "forward"}
+            # 其他一律代接
+            return {"final_action": "proxy"}
+
+        # 正常模式
         call_type = get_call_type(type_id)
+        action = get_action(call_type, presence_mode)
+        return {"final_action": action}
 
-        # 确定最终动作
-        action = get_action(call_type, mode)
+    def _route_by_type(self, state: dict) -> str:
+        """条件路由：根据 type_id 选择处理节点。"""
+        type_id = state.get("type_id", "general")
+        if type_id in ("scam", "scam_risk", "telemarketing", "game_promo"):
+            return "scam"
+        if type_id in ("food_delivery", "express", "taxi_arrived", "bank"):
+            return "business"
+        if type_id in ("family", "leader", "urgent"):
+            return "urgent"
+        return "normal"
 
-        logger.info("=" * 50)
-        logger.info(f"📍 动作: {action} (类型={call_type.name}, 机主={presence.get_summary()})")
+    def _node_handle_scam(self, state: dict) -> dict:
+        """诈骗处理节点。"""
+        text = state.get("call_text", "")
+        confidence = state.get("confidence", 0.8)
 
-        # --- reject: 直接拒接 ---
-        if action == "reject":
-            notification = call_type.notification.format(call_text=call_text[:200])
-            return {
-                "final_action": "reject",
-                "final_message": notification,
-                "agent_reply": "",
-            }
-
-        # --- forward: 转接机主 ---
-        if action == "forward":
-            return {
-                "final_action": "forward",
-                "final_message": f"{call_type.emoji} {call_type.name} → 转接机主:\n内容: {call_text[:200]}",
-                "agent_reply": "好的，马上帮您转接机主～",
-            }
-
-        # --- proxy: AI 代接对话（外卖/快递/打车）---
-        if action == "proxy":
-            reply_template = get_reply(call_type, mode)
-            conv_state = self.business_handler.start_conversation()
-            result = self.business_handler.process_turn(
-                caller_text=call_text,
-                collected_info=conv_state["collected_info"],
-                history=conv_state["history"],
+        # 使用 LLMClient 获取详细分析
+        try:
+            analysis = self.llm_client.chat(
+                messages=[{
+                    "role": "user",
+                    "content": f"分析以下来电是否为诈骗，简要说明理由：\n{text}"
+                }],
+                response_type="text",
+                default_response="疑似诈骗电话",
             )
-            if result.get("is_complete"):
-                return {
-                    "business_result": result,
-                    "final_action": "summary_card",
-                    "final_message": result.get("summary_text", call_type.notification.format(call_text=call_text[:200])),
-                    "agent_reply": result.get("agent_text", ""),
-                }
-            return {
-                "business_result": result,
-                "final_action": "continue_conversation",
-                "final_message": "待后续对话补充信息",
-                "agent_reply": result.get("agent_text", ""),
-            }
+        except Exception:
+            analysis = "疑似诈骗电话"
 
-        # --- record: 记录留言 ---
-        if action == "record":
-            reply = get_reply(call_type, mode)
-            if not reply:
-                reply = "好的，机主现在不方便接电话，有什么需要转达的吗？"
-            return {
-                "final_action": "general_reply",
-                "final_message": f"{call_type.emoji} {call_type.name}:\n{call_text[:200]}",
-                "agent_reply": reply,
-                "conversation_history": [
-                    {"role": "user", "content": call_text},
-                    {"role": "assistant", "content": reply},
-                ],
-            }
+        # 更新来电者画像
+        caller_number = state.get("caller_number", "")
+        if caller_number:
+            profile = self.caller_profile_store.get_or_create(caller_number)
+            profile.add_call("scam", confidence)
+            self.caller_profile_store.update(profile)
 
-        # --- ask: 追问信息 ---
-        if action in ("ask", "continue_conversation"):
-            reply = get_reply(call_type, mode)
-            if not reply:
-                reply = "请问您是哪位？找机主有什么事吗？"
-            return {
-                "final_action": "continue_conversation",
-                "final_message": f"{call_type.emoji} {call_type.name} (待确认)",
-                "agent_reply": reply,
-                "conversation_history": [
-                    {"role": "user", "content": call_text},
-                    {"role": "assistant", "content": reply},
-                ],
-            }
+        # 生成诈骗拦截卡片
+        type_id = state.get("type_id", "scam")
+        card = self.card_builder.build_scam_log(
+            scam_type=state.get("call_type_name", "诈骗拦截"),
+            reason=analysis[:100] if analysis else "疑似诈骗",
+            confidence=confidence,
+        )
 
-        # --- 兜底 ---
-        prefix = presence.get_reply_prefix()
         return {
-            "final_action": "general_reply",
-            "final_message": f"来电: {call_text[:200]}",
-            "agent_reply": f"{prefix}已帮您转达，稍后会回您～",
+            "agent_reply": "",
+            "notification_card": card.to_dict(),
         }
 
+    def _node_handle_business(self, state: dict) -> dict:
+        """业务处理节点（外卖/快递/银行等）。"""
+        text = state.get("call_text", "")
+        type_id = state.get("type_id", "general")
+        presence_mode = state.get("presence_mode", "free")
+
+        # 更新对话记忆
+        self.conversation_memory.add_user_message(text)
+
+        # 从对话中提取关键信息更新工作记忆
+        self._extract_business_info(text, type_id)
+
+        # 使用 BusinessHandler 生成回复
+        try:
+            result = self.business_handler.process_turn(
+                caller_text=text,
+                collected_info=self.conversation_memory.working_memory.to_dict(),
+                history=self.conversation_memory.short_term,
+            )
+            reply = result.get("agent_text", "") if isinstance(result, dict) else str(result)
+        except Exception:
+            call_type = get_call_type(type_id)
+            reply = get_reply(call_type, presence_mode)
+
+        self.conversation_memory.add_assistant_message(reply)
+
+        # 检查对话是否完成
+        is_complete = result.get("is_complete", False) if isinstance(result, dict) else True
+
+        # 只在对话完成时生成业务卡片
+        wm = self.conversation_memory.working_memory
+        card = None
+        if is_complete:
+            if type_id in ("food_delivery", "express"):
+                card = self.card_builder.build_delivery_card(
+                    call_type="外卖" if type_id == "food_delivery" else "快递",
+                    company=wm.caller_company or "未知平台",
+                    item=wm.purpose_detail or "物品",
+                    location=wm.delivery_location or "待确认",
+                    notes=wm.delivery_notes or "",
+                )
+            else:
+                card = self.card_builder.build_message_card(
+                    caller=wm.caller_identity or "来电者",
+                    message=wm.caller_purpose or text[:100],
+                    relationship=state.get("call_type_name", "业务"),
+                )
+
+        # 更新来电者画像
+        caller_number = state.get("caller_number", "")
+        if caller_number:
+            profile = self.caller_profile_store.get_or_create(caller_number)
+            profile.add_call(type_id, state.get("confidence", 0.8))
+            self.caller_profile_store.update(profile)
+
+        return {
+            "agent_reply": reply,
+            "notification_card": card.to_dict() if card else None,
+            "final_action": "summary_card" if is_complete else "continue_conversation",
+        }
+
+    def _node_handle_urgent(self, state: dict) -> dict:
+        """紧急来电处理节点。"""
+        text = state.get("call_text", "")
+        presence_mode = state.get("presence_mode", "free")
+
+        self.conversation_memory.add_user_message(text)
+
+        try:
+            result = self.urgent_forwarder.assess(text)
+            should_forward = result.get("should_forward", False)
+            urgency = result.get("urgency_level", "high")
+        except Exception:
+            should_forward = False
+            urgency = "high"
+
+        # 决定回复和动作
+        if should_forward:
+            reply = result.get("agent_text", "好的，我马上通知机主。")
+            card = self.card_builder.build_urgent_alert(
+                caller=self.conversation_memory.working_memory.caller_identity or "来电者",
+                reason=text[:100],
+                urgency_level=urgency,
+            )
+            effective_action = "forward"
+        else:
+            # 非紧急：空闲模式用友好模板，忙碌/免打扰用 forwarder 的回复
+            card = None
+            effective_action = "continue_conversation"
+            if presence_mode == "free":
+                call_type = get_call_type(state.get("type_id", "general"))
+                reply = get_reply(call_type, "free")
+            else:
+                reply = result.get("agent_text", "")
+
+        self.conversation_memory.add_assistant_message(reply)
+
+        # 更新画像
+        caller_number = state.get("caller_number", "")
+        if caller_number:
+            profile = self.caller_profile_store.get_or_create(caller_number)
+            profile.add_call("urgent", state.get("confidence", 0.8))
+            self.caller_profile_store.update(profile)
+
+        return {
+            "agent_reply": reply,
+            "notification_card": card.to_dict() if card else None,
+            "final_action": effective_action,
+        }
+
+    def _node_handle_normal(self, state: dict) -> dict:
+        """普通来电处理节点。"""
+        text = state.get("call_text", "")
+        type_id = state.get("type_id", "general")
+        presence_mode = state.get("presence_mode", "free")
+        final_action = state.get("final_action", "forward")
+
+        self.conversation_memory.add_user_message(text)
+
+        if final_action == "proxy":
+            # 代接模式：礼貌回复并留言
+            reply = "您好，机主现在不方便接听电话。请问您有什么事，我可以帮忙转达。"
+            self.conversation_memory.add_assistant_message(reply)
+
+            card = self.card_builder.build_message_card(
+                caller=self.conversation_memory.working_memory.caller_identity or "来电者",
+                message=text[:100],
+                relationship="普通来电",
+            )
+            # proxy 模式也是问问题 → 继续对话
+            effective_action = "continue_conversation"
+        elif final_action == "general_reply":
+            # 真正的终结动作：礼貌结束
+            call_type = get_call_type(type_id)
+            reply = get_reply(call_type, presence_mode)
+            self.conversation_memory.add_assistant_message(reply)
+            card = None
+            effective_action = "general_reply"
+        else:
+            # forward/ask/continue_conversation → 先问清楚再决定
+            call_type = get_call_type(type_id)
+            reply = get_reply(call_type, presence_mode)
+            self.conversation_memory.add_assistant_message(reply)
+            card = None
+            effective_action = "continue_conversation"
+
+        # 更新画像
+        caller_number = state.get("caller_number", "")
+        if caller_number:
+            profile = self.caller_profile_store.get_or_create(caller_number)
+            profile.add_call(type_id, state.get("confidence", 0.5))
+            self.caller_profile_store.update(profile)
+
+        return {
+            "agent_reply": reply,
+            "notification_card": card.to_dict() if card else None,
+            "final_action": effective_action,
+        }
+
+    def _node_notify(self, state: dict) -> dict:
+        """通知节点：保存卡片 + 记录通话 + 更新录音信息。"""
+        card_dict = state.get("notification_card")
+        if card_dict:
+            try:
+                from src.notification.card_builder import NotificationCard
+                card = NotificationCard(**card_dict)
+                self.notification_store.save(card)
+            except Exception as e:
+                logger.warning(f"保存通知卡片失败: {e}")
+
+        # 记录通话
+        try:
+            session_id = self.call_logger.start_session(
+                caller_number=state.get("caller_number", ""),
+                caller_text=state.get("call_text", ""),
+            )
+            self.call_logger.log_classification(
+                session_id,
+                state.get("type_id", "general"),
+                state.get("call_type_name", "未知"),
+                state.get("confidence", 0.0),
+                state.get("classify_method", "unknown"),
+            )
+            self.call_logger.log_action(
+                session_id,
+                state.get("final_action", "unknown"),
+                state.get("agent_reply", ""),
+            )
+            self.call_logger.end_session(
+                session_id,
+                notification_card=card_dict,
+            )
+
+            # 更新录音关联信息
+            if self.recorder:
+                try:
+                    self.recorder.update_recording_info(
+                        session_id,
+                        call_type=state.get("type_id", ""),
+                        final_action=state.get("final_action", ""),
+                    )
+                except Exception as e:
+                    logger.debug(f"更新录音信息跳过: {e}")
+        except Exception as e:
+            logger.warning(f"记录通话失败: {e}")
+
+        return {}
+
     # ============================================================
-    # 运行入口
+    # 辅助方法
     # ============================================================
 
-    def run(self, call_text: str) -> dict:
+    def _extract_business_info(self, text: str, type_id: str) -> None:
+        """从对话文本中提取业务关键信息，更新工作记忆。"""
+        wm = self.conversation_memory.working_memory
+
+        # 根据类型设置默认身份
+        if type_id == "food_delivery" and not wm.caller_identity:
+            wm.caller_identity = "外卖配送员"
+        elif type_id == "express" and not wm.caller_identity:
+            wm.caller_identity = "快递员"
+
+        # 尝试提取平台名
+        platforms = ["美团", "饿了么", "顺丰", "京东", "中通", "圆通", "韵达", "申通", "极兔"]
+        for p in platforms:
+            if p in text and not wm.caller_company:
+                wm.caller_company = p
+                break
+
+        # 尝试提取配送地点
+        location_keywords = ["放", "放在", "送到", "在", "门口", "楼下", "驿站", "快递柜", "前台"]
+        for kw in location_keywords:
+            idx = text.find(kw)
+            if idx >= 0 and not wm.delivery_location:
+                wm.delivery_location = text[idx:idx + 20]
+                break
+
+        # 设置目的
+        if type_id == "food_delivery" and not wm.caller_purpose:
+            wm.caller_purpose = "送外卖"
+        elif type_id == "express" and not wm.caller_purpose:
+            wm.caller_purpose = "送快递"
+
+    # ============================================================
+    # 公共接口
+    # ============================================================
+
+    def run(self, call_text: str, caller_number: str = "") -> dict:
         """
-        运行完整的来电处理流程。
+        处理一次来电。
 
         参数:
-            call_text: 来电语音转文字文本
+            call_text: STT 识别的来电文本
+            caller_number: 来电号码
 
         返回:
             dict: 处理结果
         """
-        if not call_text or not call_text.strip():
-            return {
-                "final_action": "general_reply",
-                "final_message": "未收到来电内容",
+        # 重置对话记忆
+        self.conversation_memory.reset()
+
+        # 开始录音
+        call_id = f"call_{uuid.uuid4().hex[:8]}"
+        if self.recorder:
+            try:
+                self.recorder.start(call_id, caller_number=caller_number)
+            except Exception as e:
+                logger.debug(f"开始录音失败: {e}")
+
+        # 执行 LangGraph
+        initial_state = {
+            "call_text": call_text,
+            "caller_number": caller_number,
+        }
+        try:
+            result = self.graph.invoke(initial_state)
+        except Exception as e:
+            logger.error(f"LangGraph 执行失败: {e}")
+            result = {
+                "final_action": "error",
+                "final_message": str(e),
                 "agent_reply": "",
             }
 
-        logger.info("")
-        logger.info("╔══════════════════════════════════════════╗")
-        logger.info("║    AI 语音通话助手 v2 — 开始处理来电      ║")
-        logger.info(f"║ 来电: {call_text[:50]}...")
-        logger.info("╚══════════════════════════════════════════╝")
+        # 停止录音
+        if self.recorder:
+            try:
+                self.recorder.stop()
+            except Exception as e:
+                logger.debug(f"停止录音失败: {e}")
 
-        initial_state: OrchestratorState = {
-            "call_text": call_text,
-            "conversation_history": [],
-            "type_id": "",
-            "call_type_name": "",
-            "confidence": 0.0,
-            "classify_method": "",
-            "final_action": "",
-            "final_message": "",
-            "agent_reply": "",
-            "business_result": {},
-            "urgent_result": {},
-        }
+        return dict(result)
 
-        try:
-            final_state = self.graph.invoke(initial_state)
-        except Exception as e:
-            logger.error(f"调度器异常: {e}")
-            return {
-                "final_action": "error",
-                "final_message": f"系统异常: {str(e)[:200]}",
-                "agent_reply": "系统异常，请稍后再试。",
-            }
-
-        result = {
-            "final_action": final_state.get("final_action", "error"),
-            "final_message": final_state.get("final_message", ""),
-            "agent_reply": final_state.get("agent_reply", ""),
-            "type_id": final_state.get("type_id", ""),
-            "call_type_name": final_state.get("call_type_name", ""),
-            "confidence": final_state.get("confidence", 0.0),
-            "classify_method": final_state.get("classify_method", ""),
-            "full_state": final_state,
-        }
-
-        logger.info(f"处理完成 → {result['final_action']} "
-                     f"({result.get('call_type_name', '?')})")
-        return result
-
-    def resume_conversation(self, previous_result: dict, new_caller_text: str) -> dict:
+    def resume_conversation(self, previous_result: dict, new_text: str) -> dict:
         """
-        恢复多轮对话。关键改进：每轮都重新分类，不盲目继承旧类型。
+        继续多轮对话。保持上下文，只需重新分类并处理新文本。
 
         参数:
-            previous_result: 上一轮结果
-            new_caller_text: 新的话音文字
+            previous_result: 上一轮 run() 或 resume_conversation() 的返回值
+            new_text: 来电者新说的话
 
         返回:
-            dict: 处理结果（与 run() 格式相同）
+            dict: 处理结果
         """
-        logger.info("")
-        logger.info("╔══════════════════════════════════════════╗")
-        logger.info(f"║  📞 继续对话: {new_caller_text[:50]}...")
-        logger.info("╚══════════════════════════════════════════╝")
+        logger.info(f"继续对话: {new_text[:50]}...")
 
-        # 【重要】重新分类：对方的新回复可能包含关键信息
-        classify_result = self.classifier.classify(new_caller_text)
-        type_id = classify_result.type_id
-        call_type = classify_result.call_type
-        logger.info(f"  重新分类: {call_type.name} (置信度={classify_result.confidence:.0%})")
+        prev_action = previous_result.get("final_action", "")
+        prev_type = previous_result.get("type_id", "general")
 
-        presence = get_presence()
-        mode = presence.get_mode()
-        full_state = previous_result.get("full_state", {})
+        # 重新分类
+        classify_result = self.classifier.classify(new_text)
+        new_type = classify_result.type_id
+        logger.info(f"  重新分类: {classify_result.call_type.name} (置信度={classify_result.confidence:.0%})")
 
-        # 如果新分类是外卖/快递/打车 → 切到业务处理
-        if type_id in ("food_delivery", "express", "taxi_arrived"):
-            action = get_action(call_type, mode)
-            if action == "proxy":
-                # 延续已有的对话上下文，不新开 start_conversation
-                prev_business = full_state.get("business_result", {})
-                collected_info = prev_business.get("collected_info", {
-                    "call_type": "", "company": "", "item_description": "",
-                    "location": "", "contact_person": "", "additional_notes": "",
-                })
-                history = prev_business.get("history", [])
-                # 如果这是首轮业务对话，先记录来电者已经说了什么
-                if not history:
-                    history = [{"role": "user", "content": new_caller_text}]
-                else:
-                    history.append({"role": "user", "content": new_caller_text})
-
-                result = self.business_handler.process_turn(
-                    caller_text=new_caller_text,
-                    collected_info=collected_info,
-                    history=history,
-                )
-                return {
-                    "final_action": "summary_card" if result.get("is_complete") else "continue_conversation",
-                    "final_message": result.get("summary_text", call_type.notification.format(call_text=new_caller_text[:200])),
-                    "agent_reply": result.get("agent_text", ""),
-                    "type_id": type_id,
-                    "call_type_name": call_type.name,
-                    "full_state": {**full_state, "business_result": result},
-                }
-
-        # 如果新分类是诈骗/推销 → 直接拒接
-        if type_id in ("scam", "scam_risk", "telemarketing", "game_promo"):
+        # 如果新分类变成诈骗/推销 → 立即拒接
+        if new_type in ("scam", "scam_risk", "telemarketing", "game_promo"):
+            caller_number = previous_result.get("caller_number", "")
+            if caller_number:
+                profile = self.caller_profile_store.get_or_create(caller_number)
+                profile.add_call(new_type, classify_result.confidence)
+                self.caller_profile_store.update(profile)
+            card = self.card_builder.build_scam_log(
+                scam_type=classify_result.call_type.name,
+                reason="多轮对话中检测到诈骗特征",
+                confidence=classify_result.confidence,
+            )
             return {
                 "final_action": "reject",
-                "final_message": call_type.notification.format(call_text=new_caller_text[:200]),
+                "type_id": new_type,
+                "call_type_name": classify_result.call_type.name,
+                "confidence": classify_result.confidence,
+                "classify_method": classify_result.method,
                 "agent_reply": "",
-                "type_id": type_id,
-                "call_type_name": call_type.name,
+                "notification_card": card.to_dict(),
             }
 
-        # 追问类：用 LLM 判断下一步
-        prefix = presence.get_reply_prefix()
-        history = full_state.get("conversation_history", [])
-        conversation_stage = len(history) // 2 + 1
+        # 如果是业务类对话，继续业务处理
+        if new_type in ("food_delivery", "express", "taxi_arrived", "bank"):
+            self.conversation_memory.add_user_message(new_text)
+            self._extract_business_info(new_text, new_type)
 
-        action, reply = self._decide_next_action(
-            new_caller_text, call_type, conversation_stage, prefix
-        )
+            try:
+                biz_result = self.business_handler.process_turn(
+                    caller_text=new_text,
+                    collected_info=self.conversation_memory.working_memory.to_dict(),
+                    history=self.conversation_memory.short_term,
+                )
+                reply = biz_result.get("agent_text", "") if isinstance(biz_result, dict) else str(biz_result)
+                is_complete = biz_result.get("is_complete", False) if isinstance(biz_result, dict) else True
+            except Exception:
+                call_type = get_call_type(new_type)
+                reply = get_reply(call_type, self.presence.get_mode())
+                is_complete = True
 
-        history.append({"role": "user", "content": new_caller_text})
-        history.append({"role": "assistant", "content": reply})
+            self.conversation_memory.add_assistant_message(reply)
 
+            card = None
+            if is_complete:
+                wm = self.conversation_memory.working_memory
+                if new_type in ("food_delivery", "express"):
+                    card = self.card_builder.build_delivery_card(
+                        call_type="外卖" if new_type == "food_delivery" else "快递",
+                        company=wm.caller_company or "未知平台",
+                        item=wm.purpose_detail or "物品",
+                        location=wm.delivery_location or "待确认",
+                        notes=wm.delivery_notes or "",
+                    )
+                else:
+                    card = self.card_builder.build_message_card(
+                        caller=wm.caller_identity or "来电者",
+                        message=wm.caller_purpose or new_text[:100],
+                        relationship=classify_result.call_type.name,
+                    )
+
+            return {
+                "final_action": "summary_card" if is_complete else "continue_conversation",
+                "type_id": new_type,
+                "call_type_name": classify_result.call_type.name,
+                "confidence": classify_result.confidence,
+                "classify_method": classify_result.method,
+                "agent_reply": reply,
+                "notification_card": card.to_dict() if card else None,
+            }
+
+        # 如果是熟人/家人/领导来电 → 继续追问或转接
+        if new_type in ("friend", "family", "leader", "colleague", "client", "general"):
+            self.conversation_memory.add_user_message(new_text)
+
+            # 尝试用紧急转接评估
+            try:
+                ug_result = self.urgent_forwarder.assess(
+                    new_text,
+                    history=self.conversation_memory.short_term,
+                )
+                reply = ug_result.get("agent_text", "")
+                should_forward = ug_result.get("should_forward", False)
+                urgency = ug_result.get("urgency_level", "low")
+            except Exception:
+                reply = "好的，我知道了。请问还有其他事吗？"
+                should_forward = False
+                urgency = "low"
+
+            self.conversation_memory.add_assistant_message(reply)
+
+            if should_forward:
+                card = self.card_builder.build_urgent_alert(
+                    caller=self.conversation_memory.working_memory.caller_identity or "来电者",
+                    reason=new_text[:100],
+                    urgency_level=urgency,
+                )
+                return {
+                    "final_action": "forward",
+                    "type_id": new_type,
+                    "call_type_name": classify_result.call_type.name,
+                    "confidence": classify_result.confidence,
+                    "classify_method": classify_result.method,
+                    "agent_reply": reply,
+                    "notification_card": card.to_dict(),
+                }
+            else:
+                # 追问模式：检查对话轮数，超过3轮就结束
+                turns = len(self.conversation_memory.short_term) // 2
+                if turns >= 3:
+                    card = self.card_builder.build_message_card(
+                        caller=self.conversation_memory.working_memory.caller_identity or "来电者",
+                        message=new_text[:100],
+                        relationship=classify_result.call_type.name,
+                    )
+                    return {
+                        "final_action": "general_reply",
+                        "type_id": new_type,
+                        "call_type_name": classify_result.call_type.name,
+                        "confidence": classify_result.confidence,
+                        "classify_method": classify_result.method,
+                        "agent_reply": reply,
+                        "notification_card": card.to_dict(),
+                    }
+                return {
+                    "final_action": "continue_conversation",
+                    "type_id": new_type,
+                    "call_type_name": classify_result.call_type.name,
+                    "confidence": classify_result.confidence,
+                    "classify_method": classify_result.method,
+                    "agent_reply": reply,
+                }
+
+        # 其他类型：当作新对话结束
         return {
-            "final_action": action,
-            "final_message": f"{call_type.emoji} {call_type.name}:\n{new_caller_text[:200]}",
-            "agent_reply": reply,
-            "type_id": type_id,
-            "call_type_name": call_type.name,
-            "full_state": {**full_state, "conversation_history": history},
+            "final_action": "general_reply",
+            "type_id": new_type,
+            "call_type_name": classify_result.call_type.name,
+            "confidence": classify_result.confidence,
+            "classify_method": classify_result.method,
+            "agent_reply": "",
         }
 
-    def _decide_next_action(
-        self, text: str, call_type: CallType, stage: int, prefix: str
-    ) -> tuple[str, str]:
+    def learn_habit(self, user_input: str) -> dict:
         """
-        根据对方回复决定下一步动作。
-        优先用 LLM 判断，失败则用规则。
+        机主习惯学习接口。
+
+        参数:
+            user_input: 机主的自然语言输入
 
         返回:
-            (action, reply)
+            dict: 学习结果
         """
-        try:
-            from openai import OpenAI
+        return self.habit_learner.learn_from_conversation(user_input)
 
-            llm_cfg = self.config.get("llm", {})
-            client = OpenAI(
-                api_key=llm_cfg.get("api_key", ""),
-                base_url=llm_cfg.get("base_url", "https://api.deepseek.com/v1"),
-            )
+    def end_activity(self, keyword: str = "") -> Optional[str]:
+        """结束当前活动。"""
+        return self.habit_learner.end_current_activity(keyword)
 
-            prompt = f"""来电者说："{text}"
-来电类型：{call_type.name}
-对话阶段：已回答身份+来意
-机主状态：{prefix}
+    def get_habits_summary(self) -> str:
+        """获取习惯摘要。"""
+        return self.habit_learner.get_habits_summary()
 
-判断下一步：
-- 如果是推销/广告/商业目的 → 拒绝，说"机主现在不方便"
-- 如果是正常社交（吃饭聚会聊天约）且机主有空 → 转接
-- 如果机主忙/免打扰 → 告知状态并结束
-- 不确定 → 再问一句
+    def get_today_stats(self) -> dict:
+        """获取今日通话统计。"""
+        return self.call_logger.get_today_stats()
 
-输出（竖线分隔）：
-转接|（转接语）
-拒绝|（拒绝语）
-追问|（追问语）
-结束|（结束语）"""
+    def get_caller_profile(self, phone_number: str) -> Optional[CallerProfile]:
+        """查询来电者画像。"""
+        return self.caller_profile_store.lookup(phone_number)
 
-            response = client.chat.completions.create(
-                model=llm_cfg.get("model", "deepseek-chat"),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=100,
-            )
+    def blacklist_caller(self, phone_number: str) -> None:
+        """将号码加入黑名单。"""
+        self.caller_profile_store.set_blacklist(phone_number)
 
-            output = response.choices[0].message.content.strip()
-            if "|" in output:
-                parts = output.split("|", 1)
-                a = parts[0].strip()
-                r = parts[1].strip()
-                if "转接" in a:
-                    return "forward", r
-                if "追问" in a:
-                    return "continue_conversation", r
-                if "拒绝" in a:
-                    return "general_reply", r
-                return "general_reply", r
+    def whitelist_caller(self, phone_number: str) -> None:
+        """将号码加入白名单。"""
+        self.caller_profile_store.set_whitelist(phone_number)
 
-        except Exception as e:
-            logger.warning(f"下一步判断失败: {e}")
+    def get_profile_stats(self) -> dict:
+        """获取画像统计。"""
+        return self.caller_profile_store.get_stats()
 
-        return "general_reply", f"{prefix}已帮您转达，稍后会回您～"
+    def get_recent_recordings(self, limit: int = 10) -> list:
+        """获取最近的录音列表。"""
+        if self.recorder:
+            try:
+                return self.recorder.list_recordings(limit=limit)
+            except Exception:
+                pass
+        return []
+
+    def get_recent_notifications(self, limit: int = 10) -> list:
+        """获取最近的通知卡片。"""
+        return self.notification_store.load_recent(limit)
 
 
 # ============================================================
@@ -435,26 +869,45 @@ if __name__ == "__main__":
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-    from src.utils.logger import load_config
+    from src.core.config import load_and_validate_config
 
-    config = load_config("config.yaml")
+    config = load_and_validate_config("config.yaml")
     orch = CallOrchestrator(config)
 
+    # 测试来电处理
     tests = [
-        "我是美团外卖的，你的餐到楼下了",
-        "您好，我是市公安局的，你涉嫌洗钱案件",
-        "喂，在干嘛呢",
-        "领导，明天下午有个会议",
-        "你的快递到菜鸟驿站了",
-        "你好，我们这边有一个课程推荐",
-        "妈，我今天晚上回家吃饭",
+        ("13800001111", "我是美团外卖的，你的餐到楼下了"),
+        ("13800002222", "您好，我是市公安局的，你涉嫌洗钱案件"),
+        ("13800003333", "妈，我今天晚上回家吃饭"),
+        ("13800004444", "你的快递到菜鸟驿站了"),
+        ("13800005555", "领导，明天下午有个紧急会议"),
+        ("13800001111", "美团外卖，你上一单的餐到了"),
     ]
 
-    for t in tests:
-        result = orch.run(t)
-        print(f"\n来电: {t}")
+    for number, text in tests:
+        result = orch.run(text, caller_number=number)
+        print(f"\n来电: {text}")
+        print(f"  号码: {number}")
         print(f"  类型: {result.get('call_type_name', '?')} "
-              f"(置信度={result.get('confidence',0):.0%}, "
-              f"方法={result.get('classify_method','?')})")
-        print(f"  动作: {result['final_action']}")
-        print(f"  回复: {result['agent_reply'][:60]}")
+              f"(置信度={result.get('confidence', 0):.0%})")
+        print(f"  动作: {result.get('final_action')}")
+        print(f"  回复: {result.get('agent_reply', '')[:60]}")
+        if result.get('notification_card'):
+            print(f"  📬 卡片: {result['notification_card'].get('title', '')}")
+
+        # 查看画像
+        profile = orch.get_caller_profile(number)
+        if profile:
+            print(f"  👤 画像: 信任={profile.trust_score:.2f} "
+                  f"来电={profile.call_count}次 标签={profile.tags}")
+
+    # 测试习惯学习
+    print("\n" + "=" * 50)
+    print("习惯学习测试:")
+    habit_result = orch.learn_habit("我要自习一下午")
+    print(f"  回复: {habit_result['reply']}")
+    print(f"\n{orch.get_habits_summary()}")
+
+    # 统计
+    print(f"\n今日统计: {orch.get_today_stats()}")
+    print(f"画像统计: {orch.get_profile_stats()}")
